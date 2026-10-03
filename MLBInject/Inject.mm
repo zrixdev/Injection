@@ -1,7 +1,7 @@
 // MLBInject — internal ESP for MLBB (arm64, injected via ElleKit/TrollFools)
-// v5: world-space box sizing (project feet + head) — scale-invariant,
-// no clipW dependency. Unrotated scene-attached window, non-key, manual
-// Metal + CADisplayLink, logs to MLBB Documents/mlbesp_log.txt.
+// v6: ents=0 deadlock fixed (snaps before projection, no worker-side rejects,
+// pos B default). Manual Metal + CADisplayLink, non-key window, unrotated
+// scene-attached overlay. Logs to MLBB Documents/mlbesp_log.txt.
 //
 // Offset provenance (verified via iGODGame disassembly):
 //   BM class slot 0x7BFBF70   <- Battle.ShowStrategyComp::get_battleManager
@@ -130,7 +130,7 @@ static uint64_t g_uf = 0;
 static float    g_vp[16];
 static bool     g_mat_ok = false;
 static int      g_list_off = -1;
-static int      g_pos_sel = 0;
+static int      g_pos_sel = 1;      // v6: default B — the live position set
 static int      g_static_a_ticks = 0;
 
 typedef struct KlassCache { uint64_t obj; bool hero; } KlassCache;
@@ -288,7 +288,7 @@ static void worker_loop(void) {
             snprintf(f.status, sizeof f.status, "menu / lobby");
             os_unfair_lock_lock(&g_lock); g_frame = f; os_unfair_lock_unlock(&g_lock);
             g_list_off = -1; g_mat_ok = false; g_kcache_n = 0;
-            g_pos_sel = 0; g_uf = 0;
+            g_pos_sel = 1; g_uf = 0;
             sleep(1); continue;
         }
         uint64_t statics = rd64(klass + OFF_CLASS_STATICS);
@@ -297,7 +297,7 @@ static void worker_loop(void) {
             EspFrame f; memset(&f, 0, sizeof f);
             snprintf(f.status, sizeof f.status, "lobby (no battle instance)");
             os_unfair_lock_lock(&g_lock); g_frame = f; os_unfair_lock_unlock(&g_lock);
-            g_list_off = -1; g_mat_ok = false; g_kcache_n = 0; g_pos_sel = 0;
+            g_list_off = -1; g_mat_ok = false; g_kcache_n = 0; g_pos_sel = 1;
             usleep(500000); continue;
         }
         if (g_list_off < 0) {
@@ -326,10 +326,10 @@ static void worker_loop(void) {
             if (!e || !is_hero_obj(e)) continue;
 
             float pa[3] = {0}, pb[3] = {0};
-            if (!rd_vec3(e + OFF_ENT_POS_A, pa) || !rd_vec3(e + OFF_ENT_POS_B, pb))
-                continue;
+            if (!rd_vec3(e + OFF_ENT_POS_A, pa)) continue;
+            if (!rd_vec3(e + OFF_ENT_POS_B, pb)) continue;
 
-            // track A/B movement BEFORE any projection guards
+            // movement tracking — ALWAYS, before everything
             if (count < prev_n) {
                 move_a += fabsf(pa[0]-prev_a[count][0]) + fabsf(pa[2]-prev_a[count][2]);
                 move_b += fabsf(pb[0]-prev_b[count][0]) + fabsf(pb[2]-prev_b[count][2]);
@@ -337,56 +337,65 @@ static void worker_loop(void) {
             memcpy(prev_a[count], pa, 12);
             memcpy(prev_b[count], pb, 12);
 
+            // fill matrix-scan snapshot BEFORE any projection logic
+            if (snap_n < MAX_ENTS) {
+                snaps[snap_n].x = (g_pos_sel == 0) ? pa[0] : pb[0];
+                snaps[snap_n].y = (g_pos_sel == 0) ? pa[1] : pb[1];
+                snaps[snap_n].z = (g_pos_sel == 0) ? pa[2] : pb[2];
+                snap_n++;
+            }
+
+            // reserve the slot — entity is COUNTED no matter what happens below
+            EspEnt *en = &f.ents[count];
+            en->hp      = rdi32(e + OFF_ENT_HP);
+            en->hpmax   = rdi32(e + OFF_ENT_HPMAX);
+            en->visible = rdi32(e + OFF_ENT_CANSIGHT);
+            en->dead    = (en->hp <= 0) || (rdi32(e + OFF_ENT_DEATH) != 0);
+            en->box_h   = 0; en->box_w = 0;
+            en->sx = 0; en->sy = 0;
+
             // select position candidate
             float fx = (g_pos_sel == 0) ? pa[0] : pb[0];
             float fy = (g_pos_sel == 0) ? pa[1] : pb[1];
             float fz = (g_pos_sel == 0) ? pa[2] : pb[2];
 
-            // project feet + head (world height -> screen box, scale-invariant)
+            // world-space box sizing: project feet + head
             float sfx, sfy, shx, shy, cwf, cwh;
-            if (!project(fx, fy, fz, &sfx, &sfy, &cwf)) continue;          // feet
-            if (!project(fx, fy + HERO_H, fz, &shx, &shy, &cwh)) continue; // head
+            bool okF = project(fx, fy, fz, &sfx, &sfy, &cwf);
+            bool okH = okF && project(fx, fy + HERO_H, fz, &shx, &shy, &cwh);
 
-            if (snap_n < MAX_ENTS) {
-                snaps[snap_n].x = fx; snaps[snap_n].y = fy; snaps[snap_n].z = fz;
-                snap_n++;
+            if (okF && okH) {
+                float bh = fabsf(sfy - shy);
+                if (bh >= 2.0f && bh <= 500.0f) {
+                    en->sx = sfx;
+                    en->sy = sfy;
+                    en->box_h = bh;
+                    en->box_w = bh * 0.55f;
+                }
             }
-
-            EspEnt *en = &f.ents[count];
-            en->sx = sfx;                       // feet x
-            en->sy = sfy;                       // feet y (renderer draws y1 here)
-            en->box_h = fabsf(sfy - shy);       // feet->head screen distance
-            en->box_w = en->box_h * 0.55f;
-            en->hp      = rdi32(e + OFF_ENT_HP);
-            en->hpmax   = rdi32(e + OFF_ENT_HPMAX);
-            en->visible = rdi32(e + OFF_ENT_CANSIGHT);
-            en->dead    = (en->hp <= 0) || (rdi32(e + OFF_ENT_DEATH) != 0);
-
-            // reject degenerate boxes
-            if (en->box_h < 2.0f || en->box_h > 500.0f) continue;
+            // projection failed or degenerate -> box_h stays 0, renderer skips.
+            // Entity is still counted, snaps already filled, tracking intact.
 
             count++;
         }
         prev_n = count;
 
-        if (move_a < 0.01f && move_b > 0.5f) {
-            if (++g_static_a_ticks >= 5) { g_pos_sel = 1; g_static_a_ticks = 0; }
-        } else g_static_a_ticks = 0;
+        // auto-select: frozen selected set + moving other set -> flip
+        if (move_a < 0.01f && move_b > 0.5f && g_pos_sel == 0) {
+            g_pos_sel = 1; g_static_a_ticks = 0;
+            mlog("auto-flip A->B (A frozen)");
+        } else if (move_b < 0.01f && move_a > 0.5f && g_pos_sel == 1) {
+            g_pos_sel = 0; g_static_a_ticks = 0;
+            mlog("auto-flip B->A (B frozen)");
+        }
 
         if (!g_mat_ok && snap_n >= 3) g_mat_ok = scan_matrix(snaps, snap_n);
 
         f.matrix_ok = g_mat_ok ? 1 : 0;
         f.pos_sel   = (uint32_t)g_pos_sel;
-        f.entity_count = 0;
-        if (g_mat_ok) {
-            for (int i = 0; i < count; i++) {
-                f.ents[f.entity_count++] = f.ents[i];
-            }
-            snprintf(f.status, sizeof f.status, "ents=%u pos=%c",
-                     f.entity_count, g_pos_sel ? 'B' : 'A');
-        } else {
-            snprintf(f.status, sizeof f.status, "scanning camera matrix... ents=%d", snap_n);
-        }
+        f.entity_count = count;   // ALL heroes; renderer filters box_h==0
+        snprintf(f.status, sizeof f.status, "ents=%u mat=%s pos=%c",
+                 f.entity_count, g_mat_ok ? "ok" : "no", g_pos_sel ? 'B' : 'A');
 
         os_unfair_lock_lock(&g_lock);
         g_frame = f;
@@ -494,6 +503,7 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
     if (g_cfg.esp_on && f.matrix_ok) {
         for (uint32_t i = 0; i < f.entity_count && i < MAX_ENTS; i++) {
             const EspEnt &e = f.ents[i];
+            if (e.box_h < 2.0f) continue;              // projection failed this tick
             if (g_cfg.vision_only && !e.visible) continue;
             if (e.dead) continue;
 
@@ -635,7 +645,6 @@ static void try_create(void) {
     redSquare.backgroundColor = [UIColor redColor];
     redSquare.userInteractionEnabled = NO;
 
-    // unrotated, full-screen: scene is already landscape — 1:1 mapping
     ESPMetalView *v = [[ESPMetalView alloc] initWithFrame:scene.screen.bounds];
     [v configure:g_dev];
 
@@ -659,7 +668,7 @@ static void try_create(void) {
     objc_setAssociatedObject(v, "dl", dl, OBJC_ASSOCIATION_RETAIN);
 
     g_initialized = true;
-    mlog("overlay up (v5: world-space box sizing)");
+    mlog("overlay up (v6)");
 }
 
 static void create_loop(void) {
