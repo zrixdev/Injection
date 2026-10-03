@@ -1,9 +1,25 @@
-// MLBInject — internal ESP for MLBB (arm64). Logs every stage to the app's
-// Documents/mlbesp_log.txt so failures are diagnosable in Filza.
+// MLBInject — internal ESP for MLBB (arm64, injected via ElleKit/TrollFools)
+// Scene-aware window (iOS 13+). Opaque=NO compositing (game visible underneath).
+// Logs every stage to MLBB Documents/mlbesp_log.txt for Filza debugging.
+//
+// Offset provenance (verified via iGODGame disassembly):
+//   BM class slot 0x7BFBF70   <- Battle.ShowStrategyComp::get_battleManager
+//                                (adrp x19,#0x7bfb000; ldr x0,[x19,#0xf70])
+//   static_fields 0xA8        <- same fn (ldr x8,[x0,#0xa8])
+//   Instance static 0x0       <- same fn (ldr x0,[x8])
+//   Hp 0x1AC / HpMax 0x1B0    <- ShowEntity::get_m_HpPer (hp/hpmax*100)
+//   HpEstimate 0x270          <- get/set_m_HpEstimate (agree)
+//   CanSight 0x254            <- ShowEntity::get_m_CanSight
+//   Endure 0x278 (double)     <- ShowEntity::get_m_Endure
+//   Pos A 0x1D0 / Pos B 0x298 <- ShowEntity::get_Position tail paths
+//   LocalPlayer +0x50         <- LogicBattleManager::get_m_LocalPlayerLogic
+//   Camp 0x1EC                <- LogicFighter::get_m_EntityCampTypeReadOnly
+//   List candidate 0x198      <- BattleManager::GetAllEntities (auto-probed)
 
 #import <UIKit/UIKit.h>
 #import <Metal/Metal.h>
 #import <MetalKit/MetalKit.h>
+#import <QuartzCore/CAMetalLayer.h>
 #import <objc/runtime.h>
 #import <os/lock.h>
 #import <mach/mach.h>
@@ -33,7 +49,7 @@ static void mlog(const char *fmt, ...) {
         NSArray *dirs = NSSearchPathForDirectoriesInDomains(
             NSDocumentDirectory, NSUserDomainMask, YES);
         if (![dirs count]) return;
-            NSString *doc = [dirs objectAtIndex:0];
+        NSString *doc = [dirs objectAtIndex:0];
         snprintf(path, sizeof(path), "%s/mlbesp_log.txt",
                  doc.fileSystemRepresentation);
     }
@@ -57,17 +73,19 @@ static void mlog(const char *fmt, ...) {
 
 #define OFF_ENT_HP           0x1AC
 #define OFF_ENT_HPMAX        0x1B0
+#define OFF_ENT_HPEST        0x270
 #define OFF_ENT_CANSIGHT     0x254
+#define OFF_ENT_ENDURE       0x278
 #define OFF_ENT_POS_A        0x1D0
 #define OFF_ENT_POS_B        0x298
-#define OFF_ENT_DEATH        0xD0
+#define OFF_ENT_DEATH        0xD0      // candidate; hp<=0 covers it
 
 #define BOX_K                240.0f
 #define GAME_W               667.0f
 #define GAME_H               375.0f
 #define MAX_ENTS             64
 
-// ---------------- shared frame ----------------
+// ---------------- shared frame (worker -> renderer) ----------------
 typedef struct {
     float sx, sy, box_h, box_w;
     int32_t hp, hpmax, visible, dead;
@@ -138,12 +156,12 @@ static bool is_hero_obj(uint64_t obj) {
 }
 
 static bool list_valid(uint64_t lst) {
-    uint64_t arr  = rd64(lst + 0x10);
-    int32_t  size = rdi32(lst + 0x18);
+    uint64_t arr  = rd64(lst + 0x10);          // List<T>._items
+    int32_t  size = rdi32(lst + 0x18);         // List<T>._size
     if (!arr || size < 1 || size > 512) return false;
-    if (rdi32(arr + 0x18) != size) return false;
+    if (rdi32(arr + 0x18) != size) return false;  // array length must match
     for (int i = 0; i < size && i < 8; i++) {
-        uint64_t e = rd64(arr + 0x20 + 8ull * i);
+        uint64_t e = rd64(arr + 0x20 + 8ull * i);  // array data at 0x20
         if (!e) continue;
         uint64_t k = rd64(e);
         if (!k) continue;
@@ -241,9 +259,9 @@ static bool project(float x, float y, float z, float *sx, float *sy, float *cw) 
     float cy = g_vp[1]*x + g_vp[5]*y + g_vp[9]*z  + g_vp[13];
     float w  = g_vp[3]*x + g_vp[7]*y + g_vp[11]*z + g_vp[15];
     *cw = w;
-    if (w <= 0.001f) return false;
+    if (w <= 0.001f) return false;   // behind camera
     *sx = (cx / w * 0.5f + 0.5f) * GAME_W;
-    *sy = (1.0f - (cy / w * 0.5f + 0.5f)) * GAME_H;
+    *sy = (1.0f - (cy / w * 0.5f + 0.5f)) * GAME_H;   // Y flip Unity -> view
     return true;
 }
 
@@ -264,6 +282,7 @@ static void worker_loop(void) {
             mlog("UnityFramework @ 0x%llx", (unsigned long long)g_uf);
         }
 
+        // resolve BattleManager: slot -> class -> statics -> Instance
         uint64_t klass = rd64(g_uf + RVA_BM_CLASS_SLOT);
         char nm[64];
         if (!klass || !rd_cstr(rd64(klass + OFF_CLASS_NAME), nm, sizeof(nm)) ||
@@ -335,6 +354,7 @@ static void worker_loop(void) {
         }
         prev_n = count;
 
+        // auto-select position candidate: A frozen while B moves -> use B
         if (move_a < 0.01f && move_b > 0.5f) {
             if (++g_static_a_ticks >= 5) { g_pos_sel = 1; g_static_a_ticks = 0; }
         } else g_static_a_ticks = 0;
@@ -364,11 +384,11 @@ static void worker_loop(void) {
         g_frame = f;
         os_unfair_lock_unlock(&g_lock);
 
-        usleep(100000);
+        usleep(100000);   // 10 Hz
     }
 }
 
-// ---------------- config ----------------
+// ---------------- config (in-memory) ----------------
 struct EspCfg {
     bool esp_on, boxes, hp_bars, snaplines, vision_only, status_text;
     bool rot_right;
@@ -473,6 +493,7 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
         }
     }
 
+    // floating toggle button
     ImGui::SetNextWindowPos(ImVec2(GAME_W - 56, 8));
     ImGui::PushStyleColor(ImGuiCol_WindowBg, 0);
     ImGui::Begin("##btn", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
@@ -540,6 +561,7 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
 @interface ESPWindow : UIWindow
 @end
 @implementation ESPWindow
+// pass everything through to the game except the button + open menu
 - (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)e {
     ESPView *v = (ESPView *)self.rootViewController.view;
     if (!v) return nil;
@@ -550,7 +572,7 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
 }
 @end
 
-// ---------------- scene-aware creation ----------------
+// ---------------- scene-aware creation (iOS 13+ requirement) ----------------
 static UIWindow *g_win = nil;
 
 static UIWindowScene *find_scene(void) {
@@ -591,6 +613,8 @@ static void try_create(void) {
     v.enableSetNeedsDisplay = NO;
     v.paused = NO;
     v.backgroundColor = nil;
+    v.opaque = NO;                            // THE FIX: view must composite with alpha
+    ((CAMetalLayer *)v.layer).opaque = NO;    // layer too — opaque layer = black screen
     g_win.rootViewController.view = v;
 
     IMGUI_CHECKVERSION();
@@ -608,7 +632,7 @@ static void try_create(void) {
     objc_setAssociatedObject(g_win, "keep", g_win, OBJC_ASSOCIATION_RETAIN);
 
     g_initialized = true;
-    mlog("overlay up (scene-attached)");
+    mlog("overlay up (scene-attached, transparent)");
 }
 
 static void create_loop(void) {
