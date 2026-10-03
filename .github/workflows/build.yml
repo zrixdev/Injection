@@ -1,0 +1,51 @@
+name: Build
+
+on: [push, workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    env:
+      THEOS_PACKAGE_SCHEME: rootless
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Vendor ImGui
+        run: |
+          git clone --depth 1 --branch v1.90.4 \
+            https://github.com/ocornut/imgui.git \
+            MLBInject/imgui
+
+      - name: Setup Theos
+        run: |
+          git clone --recursive https://github.com/theos/theos.git $HOME/theos
+
+          # Xcode's full iOS SDK (theos SDK bundle lacks C++ headers)
+          XSDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          XVER=$(xcrun --sdk iphoneos --show-sdk-version)
+          mkdir -p $HOME/theos/sdks
+          ln -sfn "$XSDK" "$HOME/theos/sdks/iPhoneOS${XVER}.sdk"
+          echo "SDKVER=$XVER" >> $GITHUB_ENV
+
+      - name: Install ldid
+        run: brew install ldid
+
+      - name: Build
+        run: |
+          export THEOS=$HOME/theos
+          export THEOS_PACKAGE_SCHEME=rootless
+          make FINAL=1 TARGET="iphone:clang:${SDKVER}:14.0"
+
+      - name: Collect dylib
+        run: |
+          mkdir -p dist
+          find . -path ./MLBInject/imgui -prune -o -type f -name "*.dylib" -print | grep -v "\.o$" | while read f; do
+            cp -v "$f" dist/
+          done
+          ls -la dist/
+
+      - name: Upload dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: MLBInject.dylib
+          path: dist/*
