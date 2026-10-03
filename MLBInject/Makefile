@@ -13,7 +13,7 @@ MLBInject_FILES = Inject.mm \
     imgui/backends/imgui_impl_metal.mm
 MLBInject_FRAMEWORKS = UIKit Foundation Metal MetalKit QuartzCore
 MLBInject_CFLAGS = -Iimgui -Iimgui/backends -std=gnu++17 -fobjc-arc \
-    -fno-modules -Wno-deprecated-declarations
+    -fno-modules -Wno-error -Wno-deprecated-declarations
 MLBInject_CODESIGN_FLAGS = -S
 
 include $(THEOS_MAKE_PATH)/library.mk
