@@ -1,16 +1,6 @@
 // MLBInject — internal ESP for MLBB (arm64, inject via TrollFools)
-// In-process: resolves BattleManager via verified metadata slot, walks the
-// ShowEntity list, scans for the Unity view-projection matrix, projects hero
-// positions, renders ImGui/Metal boxes + menu. All reads crash-safe.
-//
-// Offset provenance (verified via iGODGame disassembly):
-//   BM class slot 0x7BFBF70   <- Battle.ShowStrategyComp::get_battleManager
-//   static_fields 0xA8        <- same fn   |  Instance static 0x0 <- same fn
-//   Hp 0x1AC / HpMax 0x1B0    <- ShowEntity::get_m_HpPer (hp/hpmax*100)
-//   HpEstimate 0x270          <- get/set_m_HpEstimate (agree)
-//   CanSight 0x254            <- ShowEntity::get_m_CanSight
-//   Pos A 0x1D0 / Pos B 0x298 <- ShowEntity::get_Position tail paths
-//   List candidate 0x198      <- BattleManager::GetAllEntities (auto-probed)
+// Scene-aware window (iOS 13+ requirement). Unconditional ALIVE marker for
+// diagnosis. Offset provenance: verified via iGODGame disassembly.
 
 #import <UIKit/UIKit.h>
 #import <Metal/Metal.h>
@@ -47,14 +37,14 @@ kern_return_t mach_vm_region(vm_map_t, mach_vm_address_t *, mach_vm_size_t *,
 #define OFF_ENT_CANSIGHT     0x254
 #define OFF_ENT_POS_A        0x1D0
 #define OFF_ENT_POS_B        0x298
-#define OFF_ENT_DEATH        0xD0      // candidate; hp<=0 covers it
+#define OFF_ENT_DEATH        0xD0
 
 #define BOX_K                240.0f
 #define GAME_W               667.0f
 #define GAME_H               375.0f
 #define MAX_ENTS             64
 
-// ---------------- shared frame (worker -> renderer) ----------------
+// ---------------- shared frame ----------------
 typedef struct {
     float sx, sy, box_h, box_w;
     int32_t hp, hpmax, visible, dead;
@@ -125,8 +115,8 @@ static bool is_hero_obj(uint64_t obj) {
 }
 
 static bool list_valid(uint64_t lst) {
-    uint64_t arr  = rd64(lst + 0x10);          // List<T>._items
-    int32_t  size = rdi32(lst + 0x18);         // List<T>._size
+    uint64_t arr  = rd64(lst + 0x10);
+    int32_t  size = rdi32(lst + 0x18);
     if (!arr || size < 1 || size > 512) return false;
     if (rdi32(arr + 0x18) != size) return false;
     for (int i = 0; i < size && i < 8; i++) {
@@ -355,7 +345,7 @@ static void worker_loop(void) {
     }
 }
 
-// ---------------- config (in-memory) ----------------
+// ---------------- config ----------------
 struct EspCfg {
     bool esp_on, boxes, hp_bars, snaplines, vision_only, status_text;
     bool rot_right;
@@ -395,8 +385,7 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
 - (void)mtkView:(MTKView *)view drawableSizeWillChange:(CGSize)size {}
 
 - (void)drawInMTKView:(MTKView *)view {
-    if (!g_initialized) return;
-    if (!view.currentRenderPassDescriptor) return;   // drawable not ready this frame
+    if (!view.currentRenderPassDescriptor) return;
 
     static mach_timebase_info_data_t tb;
     if (!tb.denom) mach_timebase_info(&tb);
@@ -421,6 +410,11 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
     os_unfair_lock_unlock(&g_lock);
 
     ImDrawList *dl = ImGui::GetBackgroundDrawList();
+
+    // === UNCONDITIONAL ALIVE MARKER — proves the overlay renders ===
+    dl->AddRectFilled(ImVec2(4, 4), ImVec2(24, 24), IM_COL32(255, 0, 0, 255));
+    dl->AddText(ImVec2(28, 8), IM_COL32(255, 60, 60, 255), "MLB ALIVE");
+
     if (g_cfg.esp_on && f.matrix_ok) {
         for (uint32_t i = 0; i < f.entity_count && i < MAX_ENTS; i++) {
             const EspEnt &e = f.ents[i];
@@ -449,7 +443,6 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
         }
     }
 
-    // floating toggle button
     ImGui::SetNextWindowPos(ImVec2(GAME_W - 56, 8));
     ImGui::PushStyleColor(ImGuiCol_WindowBg, 0);
     ImGui::Begin("##btn", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
@@ -467,9 +460,9 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
     ImGui::PopStyleColor();
 
     if (g_cfg.status_text) {
-        dl->AddText(ImVec2(8, 8), IM_COL32(0, 220, 255, 255), f.status);
+        dl->AddText(ImVec2(8, 30), IM_COL32(0, 220, 255, 255), f.status);
         if (!f.matrix_ok)
-            dl->AddText(ImVec2(8, 24), IM_COL32(255,200,0,255), "matrix: scanning...");
+            dl->AddText(ImVec2(8, 46), IM_COL32(255,200,0,255), "matrix: scanning...");
     }
 
     if (g_menu_open) {
@@ -503,13 +496,10 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
 
     ImGui::Render();
 
-    // our own command buffer + encoder (MTKView exposes neither)
     id<MTLCommandBuffer> cb = [g_queue commandBuffer];
     id<MTLRenderCommandEncoder> enc =
         [cb renderCommandEncoderWithDescriptor:view.currentRenderPassDescriptor];
-    [enc pushDebugGroup:@"MLBInject"];
     ImGui_ImplMetal_RenderDrawData(ImGui::GetDrawData(), cb, enc);
-    [enc popDebugGroup];
     [enc endEncoding];
     if (view.currentDrawable)
         [cb presentDrawable:view.currentDrawable];
@@ -530,33 +520,45 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
 }
 @end
 
-static void create_overlay(void) {
+// ---------------- scene-aware creation (iOS 13+ requirement) ----------------
+static UIWindow *g_win = nil;
+
+static UIWindowScene *find_scene(void) {
+    for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+        if (s.activationState == UISceneActivationStateForegroundActive &&
+            [s isKindOfClass:[UIWindowScene class]])
+            return (UIWindowScene *)s;
+    }
+    return nil;
+}
+
+static void try_create(void) {
     if (g_initialized) return;
 
+    UIWindowScene *scene = find_scene();
+    if (!scene) return;   // game not foregrounded yet
+
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
-    if (!dev) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{ create_overlay(); });
-        return;
-    }
+    if (!dev) return;
+
+    g_win = [[UIWindow alloc] initWithWindowScene:scene];
+    g_win.windowLevel = UIWindowLevelAlert + 100.0;
+    g_win.opaque = NO;
+    g_win.backgroundColor = [UIColor clearColor];
+    g_win.userInteractionEnabled = YES;
+    g_win.rootViewController = [UIViewController new];
+    g_win.rootViewController.view.backgroundColor = [UIColor clearColor];
+
     g_queue = [dev newCommandQueue];
 
-    ESPWindow *win = [[ESPWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
-    win.windowLevel = 1000000;
-    win.opaque = NO;
-    win.backgroundColor = [UIColor clearColor];
-    win.userInteractionEnabled = YES;
-    win.rootViewController = [UIViewController new];
-    win.rootViewController.view.backgroundColor = [UIColor clearColor];
-
-    ESPView *v = [[ESPView alloc] initWithFrame:[UIScreen mainScreen].bounds device:dev];
+    ESPView *v = [[ESPView alloc] initWithFrame:scene.screen.bounds device:dev];
     v.delegate = v;
     v.clearColor = MTLClearColorMake(0, 0, 0, 0);
     v.preferredFramesPerSecond = 30;
     v.enableSetNeedsDisplay = NO;
     v.paused = NO;
     v.backgroundColor = nil;
-    win.rootViewController.view = v;
+    g_win.rootViewController.view = v;
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -564,23 +566,31 @@ static void create_overlay(void) {
     ImGui::StyleColorsDark();
     ImGui_ImplMetal_Init(dev);
 
-    UIScreen *scr = [UIScreen mainScreen];
+    UIScreen *scr = scene.screen;
     v.bounds = CGRectMake(0, 0, GAME_W, GAME_H);
     v.center = CGPointMake(scr.bounds.size.width * 0.5f, scr.bounds.size.height * 0.5f);
     v.transform = CGAffineTransformMakeRotation(M_PI_2);
 
-    win.hidden = NO;
-    objc_setAssociatedObject(win, "keep", win, OBJC_ASSOCIATION_RETAIN);
+    g_win.hidden = NO;
+    objc_setAssociatedObject(g_win, "keep", g_win, OBJC_ASSOCIATION_RETAIN);
 
     g_initialized = true;
-    printf("[MLBInject] overlay up\n");
+    printf("[MLBInject] overlay up (scene-attached)\n");
+}
+
+static void create_loop(void) {
+    if (g_initialized) return;
+    dispatch_async(dispatch_get_main_queue(), ^{ try_create(); });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
+                   dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ create_loop(); });
 }
 
 __attribute__((constructor))
 static void mlb_inject_ctor(void) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{ create_overlay(); });
+    printf("[MLBInject] loaded\n");
+    create_loop();
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        sleep(3);          // let UIKit settle before worker starts
         worker_loop();
     });
 }
