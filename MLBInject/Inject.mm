@@ -3,24 +3,14 @@
 // ShowEntity list, scans for the Unity view-projection matrix, projects hero
 // positions, renders ImGui/Metal boxes + menu. All reads crash-safe.
 //
-// Offset provenance (verified this session via iGODGame disassembly):
+// Offset provenance (verified via iGODGame disassembly):
 //   BM class slot 0x7BFBF70   <- Battle.ShowStrategyComp::get_battleManager
-//                                (adrp x19,#0x7bfb000; ldr x0,[x19,#0xf70])
-//   static_fields 0xA8        <- same fn (ldr x8,[x0,#0xa8])
-//   Instance static 0x0       <- same fn (ldr x0,[x8])
+//   static_fields 0xA8        <- same fn   |  Instance static 0x0 <- same fn
 //   Hp 0x1AC / HpMax 0x1B0    <- ShowEntity::get_m_HpPer (hp/hpmax*100)
-//   HpEstimate 0x270          <- get_m_HpEstimate + set_m_HpEstimate (agree)
+//   HpEstimate 0x270          <- get/set_m_HpEstimate (agree)
 //   CanSight 0x254            <- ShowEntity::get_m_CanSight
-//   Endure 0x278 (double)     <- ShowEntity::get_m_Endure
-//   Pos A 0x1D0               <- ShowEntity::get_Position tail
-//                                (ldp s0,s1,[x0,#0x1d0]; ldr s2,[x0,#0x1d8])
-//   Pos B 0x298               <- same fn, cache-position path
-//   LocalPlayer +0x50         <- LogicBattleManager::get_m_LocalPlayerLogic
-//                                (getter+setter agree)
-//   Camp 0x1EC                <- LogicFighter::get_m_EntityCampTypeReadOnly
-//                                (ConcurrentEntityData agrees via inner ptr)
-//   List candidate 0x198      <- BattleManager::GetAllEntities
-//                                (ldr x1,[x0,#0x198]) — auto-probed anyway
+//   Pos A 0x1D0 / Pos B 0x298 <- ShowEntity::get_Position tail paths
+//   List candidate 0x198      <- BattleManager::GetAllEntities (auto-probed)
 
 #import <UIKit/UIKit.h>
 #import <Metal/Metal.h>
@@ -54,9 +44,7 @@ kern_return_t mach_vm_region(vm_map_t, mach_vm_address_t *, mach_vm_size_t *,
 
 #define OFF_ENT_HP           0x1AC
 #define OFF_ENT_HPMAX        0x1B0
-#define OFF_ENT_HPEST        0x270
 #define OFF_ENT_CANSIGHT     0x254
-#define OFF_ENT_ENDURE       0x278
 #define OFF_ENT_POS_A        0x1D0
 #define OFF_ENT_POS_B        0x298
 #define OFF_ENT_DEATH        0xD0      // candidate; hp<=0 covers it
@@ -140,9 +128,9 @@ static bool list_valid(uint64_t lst) {
     uint64_t arr  = rd64(lst + 0x10);          // List<T>._items
     int32_t  size = rdi32(lst + 0x18);         // List<T>._size
     if (!arr || size < 1 || size > 512) return false;
-    if (rdi32(arr + 0x18) != size) return false;  // array length must match
+    if (rdi32(arr + 0x18) != size) return false;
     for (int i = 0; i < size && i < 8; i++) {
-        uint64_t e = rd64(arr + 0x20 + 8ull * i);  // array data at 0x20
+        uint64_t e = rd64(arr + 0x20 + 8ull * i);
         if (!e) continue;
         uint64_t k = rd64(e);
         if (!k) continue;
@@ -240,9 +228,9 @@ static bool project(float x, float y, float z, float *sx, float *sy, float *cw) 
     float cy = g_vp[1]*x + g_vp[5]*y + g_vp[9]*z  + g_vp[13];
     float w  = g_vp[3]*x + g_vp[7]*y + g_vp[11]*z + g_vp[15];
     *cw = w;
-    if (w <= 0.001f) return false;   // behind camera
+    if (w <= 0.001f) return false;
     *sx = (cx / w * 0.5f + 0.5f) * GAME_W;
-    *sy = (1.0f - (cy / w * 0.5f + 0.5f)) * GAME_H;   // Y flip Unity -> view
+    *sy = (1.0f - (cy / w * 0.5f + 0.5f)) * GAME_H;
     return true;
 }
 
@@ -263,7 +251,6 @@ static void worker_loop(void) {
             printf("[MLBInject] UnityFramework @ 0x%llx\n", (unsigned long long)g_uf);
         }
 
-        // resolve BattleManager: slot -> class -> statics -> Instance
         uint64_t klass = rd64(g_uf + RVA_BM_CLASS_SLOT);
         char nm[64];
         if (!klass || !rd_cstr(rd64(klass + OFF_CLASS_NAME), nm, sizeof(nm)) ||
@@ -335,7 +322,6 @@ static void worker_loop(void) {
         }
         prev_n = count;
 
-        // auto-select position candidate: A frozen while B moves -> use B
         if (move_a < 0.01f && move_b > 0.5f) {
             if (++g_static_a_ticks >= 5) { g_pos_sel = 1; g_static_a_ticks = 0; }
         } else g_static_a_ticks = 0;
@@ -365,7 +351,7 @@ static void worker_loop(void) {
         g_frame = f;
         os_unfair_lock_unlock(&g_lock);
 
-        usleep(100000);   // 10 Hz
+        usleep(100000);
     }
 }
 
@@ -379,7 +365,8 @@ static EspCfg g_cfg = { true, true, true, false, true, true, true };
 // ---------------- overlay ----------------
 static bool   g_menu_open = false;
 static bool   g_initialized = false;
-static CGRect g_btn_rect_v = CGRectMake(GAME_W - 56, 8, 48, 48);   // view space
+static CGRect g_btn_rect_v = CGRectMake(GAME_W - 56, 8, 48, 48);
+static id<MTLCommandQueue> g_queue = nil;
 
 static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
     ImGuiIO &io = ImGui::GetIO();
@@ -409,6 +396,7 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
 
 - (void)drawInMTKView:(MTKView *)view {
     if (!g_initialized) return;
+    if (!view.currentRenderPassDescriptor) return;   // drawable not ready this frame
 
     static mach_timebase_info_data_t tb;
     if (!tb.denom) mach_timebase_info(&tb);
@@ -418,9 +406,10 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
     last = now;
 
     ImGuiIO &io = ImGui::GetIO();
-    io.DisplaySize = view.bounds.size;
-    io.DisplayFramebufferScale = CGSizeMake(view.drawableSize.width / view.bounds.size.width,
-                                            view.drawableSize.height / view.bounds.size.height);
+    io.DisplaySize = ImVec2(view.bounds.size.width, view.bounds.size.height);
+    io.DisplayFramebufferScale = ImVec2(
+        view.drawableSize.width  / view.bounds.size.width,
+        view.drawableSize.height / view.bounds.size.height);
     io.DeltaTime = dt_ms > 0 ? dt_ms / 1000.0f : 1.0f / 30.0f;
 
     ImGui_ImplMetal_NewFrame(view.currentRenderPassDescriptor);
@@ -502,7 +491,6 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
                     f.matrix_ok ? "ok" : "no", f.pos_sel ? 'B' : 'A');
         ImGui::End();
 
-        // apply orientation live
         CGFloat angle = g_cfg.rot_right ? -M_PI_2 : M_PI_2;
         CGAffineTransform want = CGAffineTransformMakeRotation(angle);
         if (view.transform.a != want.a || view.transform.b != want.b) {
@@ -514,17 +502,24 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
     }
 
     ImGui::Render();
-    ImGui_ImplMetal_RenderDrawData(ImGui::GetDrawData(),
-                                   view.currentCommandBuffer,
-                                   view.currentRenderCommandEncoder);
-    ImGui::EndFrame();
+
+    // our own command buffer + encoder (MTKView exposes neither)
+    id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+    id<MTLRenderCommandEncoder> enc =
+        [cb renderCommandEncoderWithDescriptor:view.currentRenderPassDescriptor];
+    [enc pushDebugGroup:@"MLBInject"];
+    ImGui_ImplMetal_RenderDrawData(ImGui::GetDrawData(), cb, enc);
+    [enc popDebugGroup];
+    [enc endEncoding];
+    if (view.currentDrawable)
+        [cb presentDrawable:view.currentDrawable];
+    [cb commit];
 }
 @end
 
 @interface ESPWindow : UIWindow
 @end
 @implementation ESPWindow
-// pass everything through to the game except the button + open menu
 - (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)e {
     ESPView *v = (ESPView *)self.rootViewController.view;
     if (!v) return nil;
@@ -544,6 +539,7 @@ static void create_overlay(void) {
                        dispatch_get_main_queue(), ^{ create_overlay(); });
         return;
     }
+    g_queue = [dev newCommandQueue];
 
     ESPWindow *win = [[ESPWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
     win.windowLevel = 1000000;
@@ -568,7 +564,6 @@ static void create_overlay(void) {
     ImGui::StyleColorsDark();
     ImGui_ImplMetal_Init(dev);
 
-    // landscape-L default
     UIScreen *scr = [UIScreen mainScreen];
     v.bounds = CGRectMake(0, 0, GAME_W, GAME_H);
     v.center = CGPointMake(scr.bounds.size.width * 0.5f, scr.bounds.size.height * 0.5f);
