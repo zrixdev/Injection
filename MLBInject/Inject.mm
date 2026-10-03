@@ -1,6 +1,5 @@
-// MLBInject — internal ESP for MLBB (arm64, inject via TrollFools)
-// Scene-aware window (iOS 13+ requirement). Unconditional ALIVE marker for
-// diagnosis. Offset provenance: verified via iGODGame disassembly.
+// MLBInject — internal ESP for MLBB (arm64). Logs every stage to the app's
+// Documents/mlbesp_log.txt so failures are diagnosable in Filza.
 
 #import <UIKit/UIKit.h>
 #import <Metal/Metal.h>
@@ -10,6 +9,7 @@
 #import <mach/mach.h>
 #import <mach-o/dyld.h>
 #import <unistd.h>
+#import <time.h>
 #import <cmath>
 #import <cstdio>
 #import <cstring>
@@ -24,6 +24,29 @@ kern_return_t mach_vm_read_overwrite(vm_map_t, mach_vm_address_t,
 kern_return_t mach_vm_region(vm_map_t, mach_vm_address_t *, mach_vm_size_t *,
                         vm_region_flavor_t, vm_region_info_t,
                         mach_msg_type_number_t *, mach_port_t *);
+}
+
+// ---------------- logging (stage tracking, Filza-readable) ----------------
+static void mlog(const char *fmt, ...) {
+    static char path[512] = {0};
+    if (!path[0]) {
+        NSArray *dirs = NSSearchPathForDirectoriesInDomains(
+            NSDocumentDirectory, NSUserDomainMask, YES);
+        if (![dirs count]) return;
+            NSString *doc = [dirs objectAtIndex:0];
+        snprintf(path, sizeof(path), "%s/mlbesp_log.txt",
+                 doc.fileSystemRepresentation);
+    }
+    FILE *f = fopen(path, "a");
+    if (!f) return;
+    time_t t = time(NULL);
+    struct tm tmv; localtime_r(&t, &tmv);
+    fprintf(f, "[%02d:%02d:%02d] ", tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+    va_list ap; va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fprintf(f, "\n");
+    fclose(f);
 }
 
 // ---------------- verified constants ----------------
@@ -137,7 +160,7 @@ static int discover_list(uint64_t bm) {
     for (size_t i = 0; i < sizeof(cands) / sizeof(cands[0]); i++) {
         uint64_t lst = rd64(bm + cands[i]);
         if (lst && list_valid(lst)) {
-            printf("[MLBInject] entity list @ BM+0x%x\n", cands[i]);
+            mlog("entity list @ BM+0x%x", cands[i]);
             return cands[i];
         }
     }
@@ -238,7 +261,7 @@ static void worker_loop(void) {
                 os_unfair_lock_lock(&g_lock); g_frame = f; os_unfair_lock_unlock(&g_lock);
                 sleep(1); continue;
             }
-            printf("[MLBInject] UnityFramework @ 0x%llx\n", (unsigned long long)g_uf);
+            mlog("UnityFramework @ 0x%llx", (unsigned long long)g_uf);
         }
 
         uint64_t klass = rd64(g_uf + RVA_BM_CLASS_SLOT);
@@ -355,6 +378,7 @@ static EspCfg g_cfg = { true, true, true, false, true, true, true };
 // ---------------- overlay ----------------
 static bool   g_menu_open = false;
 static bool   g_initialized = false;
+static bool   g_logged_first_frame = false;
 static CGRect g_btn_rect_v = CGRectMake(GAME_W - 56, 8, 48, 48);
 static id<MTLCommandQueue> g_queue = nil;
 
@@ -387,6 +411,12 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
 - (void)drawInMTKView:(MTKView *)view {
     if (!view.currentRenderPassDescriptor) return;
 
+    if (!g_logged_first_frame) {
+        g_logged_first_frame = true;
+        mlog("first frame drawn (bounds %.0fx%.0f)",
+             view.bounds.size.width, view.bounds.size.height);
+    }
+
     static mach_timebase_info_data_t tb;
     if (!tb.denom) mach_timebase_info(&tb);
     static uint64_t last = 0;
@@ -411,7 +441,7 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
 
     ImDrawList *dl = ImGui::GetBackgroundDrawList();
 
-    // === UNCONDITIONAL ALIVE MARKER — proves the overlay renders ===
+    // UNCONDITIONAL ALIVE marker — if the view renders, this is visible
     dl->AddRectFilled(ImVec2(4, 4), ImVec2(24, 24), IM_COL32(255, 0, 0, 255));
     dl->AddText(ImVec2(28, 8), IM_COL32(255, 60, 60, 255), "MLB ALIVE");
 
@@ -520,7 +550,7 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
 }
 @end
 
-// ---------------- scene-aware creation (iOS 13+ requirement) ----------------
+// ---------------- scene-aware creation ----------------
 static UIWindow *g_win = nil;
 
 static UIWindowScene *find_scene(void) {
@@ -536,10 +566,13 @@ static void try_create(void) {
     if (g_initialized) return;
 
     UIWindowScene *scene = find_scene();
-    if (!scene) return;   // game not foregrounded yet
+    if (!scene) return;
+
+    static bool logged_scene = false;
+    if (!logged_scene) { logged_scene = true; mlog("scene found, creating overlay"); }
 
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
-    if (!dev) return;
+    if (!dev) { mlog("ERROR: no Metal device"); return; }
 
     g_win = [[UIWindow alloc] initWithWindowScene:scene];
     g_win.windowLevel = UIWindowLevelAlert + 100.0;
@@ -575,22 +608,26 @@ static void try_create(void) {
     objc_setAssociatedObject(g_win, "keep", g_win, OBJC_ASSOCIATION_RETAIN);
 
     g_initialized = true;
-    printf("[MLBInject] overlay up (scene-attached)\n");
+    mlog("overlay up (scene-attached)");
 }
 
 static void create_loop(void) {
     if (g_initialized) return;
     dispatch_async(dispatch_get_main_queue(), ^{ try_create(); });
+    static int attempts = 0;
+    attempts++;
+    if (attempts == 3 || attempts == 30 || attempts == 150)
+        mlog("still hunting scene (attempt %d)...", attempts);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
                    dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ create_loop(); });
 }
 
 __attribute__((constructor))
 static void mlb_inject_ctor(void) {
-    printf("[MLBInject] loaded\n");
+    mlog("=== ctor fired, dylib loaded ===");
     create_loop();
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        sleep(3);          // let UIKit settle before worker starts
+        sleep(3);
         worker_loop();
     });
 }
