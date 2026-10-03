@@ -1,21 +1,14 @@
 // MLBInject — internal ESP for MLBB (arm64, injected via ElleKit/TrollFools)
-// v6: ents=0 deadlock fixed (snaps before projection, no worker-side rejects,
-// pos B default). Manual Metal + CADisplayLink, non-key window, unrotated
-// scene-attached overlay. Logs to MLBB Documents/mlbesp_log.txt.
+// v7: robust matrix validation (feet+head sanity), dead=hp-only (0xD0 unverified),
+// per-entity debug readout in status, image-3 style (orange boxes/HP/snaplines),
+// rescan on persistent invalid boxes. Manual Metal + CADisplayLink, non-key window.
 //
 // Offset provenance (verified via iGODGame disassembly):
-//   BM class slot 0x7BFBF70   <- Battle.ShowStrategyComp::get_battleManager
-//                                (adrp x19,#0x7bfb000; ldr x0,[x19,#0xf70])
-//   static_fields 0xA8        <- same fn (ldr x8,[x0,#0xa8])
-//   Instance static 0x0       <- same fn (ldr x0,[x8])
-//   Hp 0x1AC / HpMax 0x1B0    <- ShowEntity::get_m_HpPer (hp/hpmax*100)
-//   HpEstimate 0x270          <- get/set_m_HpEstimate (agree)
-//   CanSight 0x254            <- ShowEntity::get_m_CanSight
-//   Endure 0x278 (double)     <- ShowEntity::get_m_Endure
-//   Pos A 0x1D0 / Pos B 0x298 <- ShowEntity::get_Position tail paths
-//   LocalPlayer +0x50         <- LogicBattleManager::get_m_LocalPlayerLogic
-//   Camp 0x1EC                <- LogicFighter::get_m_EntityCampTypeReadOnly
-//   List candidate 0x198      <- BattleManager::GetAllEntities (auto-probed)
+//   BM class slot 0x7BFBF70 / statics 0xA8 / Instance 0x0  <- get_battleManager
+//   Hp 0x1AC / HpMax 0x1B0  <- get_m_HpPer
+//   CanSight 0x254          <- get_m_CanSight
+//   Pos A 0x1D0 / Pos B 0x298 <- get_Position tail paths
+//   List candidate 0x198    <- GetAllEntities (auto-probed)
 
 #import <UIKit/UIKit.h>
 #import <Metal/Metal.h>
@@ -76,7 +69,6 @@ static void mlog(const char *fmt, ...) {
 #define OFF_ENT_CANSIGHT     0x254
 #define OFF_ENT_POS_A        0x1D0
 #define OFF_ENT_POS_B        0x298
-#define OFF_ENT_DEATH        0xD0
 
 #define HERO_H               2.2f     // world-units hero height; tune 2.0-4.0
 #define GAME_W               667.0f
@@ -91,7 +83,7 @@ typedef struct {
 
 typedef struct {
     uint32_t entity_count, matrix_ok, pos_sel;
-    char status[128];
+    char status[160];
     EspEnt ents[MAX_ENTS];
 } EspFrame;
 
@@ -125,13 +117,13 @@ static uint64_t uf_base(void) {
     return 0;
 }
 
-// ---------------- resolve / walk ----------------
+// ---------------- resolve / walk state ----------------
 static uint64_t g_uf = 0;
 static float    g_vp[16];
 static bool     g_mat_ok = false;
 static int      g_list_off = -1;
-static int      g_pos_sel = 1;      // v6: default B — the live position set
-static int      g_static_a_ticks = 0;
+static int      g_pos_sel = 1;      // B default — live position set
+static int      g_bad_box_ticks = 0;
 
 typedef struct KlassCache { uint64_t obj; bool hero; } KlassCache;
 static KlassCache g_kcache[512];
@@ -154,12 +146,12 @@ static bool is_hero_obj(uint64_t obj) {
 }
 
 static bool list_valid(uint64_t lst) {
-    uint64_t arr  = rd64(lst + 0x10);          // List<T>._items
-    int32_t  size = rdi32(lst + 0x18);         // List<T>._size
+    uint64_t arr  = rd64(lst + 0x10);
+    int32_t  size = rdi32(lst + 0x18);
     if (!arr || size < 1 || size > 512) return false;
-    if (rdi32(arr + 0x18) != size) return false;  // array length must match
+    if (rdi32(arr + 0x18) != size) return false;
     for (int i = 0; i < size && i < 8; i++) {
-        uint64_t e = rd64(arr + 0x20 + 8ull * i);  // array data at 0x20
+        uint64_t e = rd64(arr + 0x20 + 8ull * i);
         if (!e) continue;
         uint64_t k = rd64(e);
         if (!k) continue;
@@ -183,23 +175,51 @@ static int discover_list(uint64_t bm) {
     return -1;
 }
 
+// ---------------- projection ----------------
+static bool project(float x, float y, float z, float *sx, float *sy, float *cw) {
+    float cx = g_vp[0]*x + g_vp[4]*y + g_vp[8]*z  + g_vp[12];
+    float cy = g_vp[1]*x + g_vp[5]*y + g_vp[9]*z  + g_vp[13];
+    float w  = g_vp[3]*x + g_vp[7]*y + g_vp[11]*z + g_vp[15];
+    *cw = w;
+    if (w <= 0.001f) return false;   // behind camera
+    *sx = (cx / w * 0.5f + 0.5f) * GAME_W;
+    *sy = (1.0f - (cy / w * 0.5f + 0.5f)) * GAME_H;
+    return true;
+}
+
+// feet+head pair projection; returns screen box height, 0 on failure
+static float project_box(float x, float y, float z,
+                         float *sx, float *sy, float *cw_out) {
+    float sfx, sfy, shx, shy, cwf, cwh;
+    if (!project(x, y, z, &sfx, &sfy, &cwf)) return 0;
+    if (!project(x, y + HERO_H, z, &shx, &shy, &cwh)) return 0;
+    *sx = sfx; *sy = sfy;
+    if (cw_out) *cw_out = cwf;
+    float bh = fabsf(sfy - shy);
+    if (bh < 2.0f || bh > 2000.0f) return 0;   // broken height axis -> reject
+    return bh;
+}
+
 // ---------------- camera matrix scan ----------------
 typedef struct Snap { float x, y, z; } Snap;
 
+// v7: validate with the SAME feet+head box projection used at runtime.
+// A wrong camera (shadow/minimap) with a broken height axis fails here.
 static int vp_score(const float m[16], const Snap *es, int n) {
+    float save[16];
+    memcpy(save, g_vp, sizeof(save));
+    memcpy(g_vp, m, sizeof(save));
     int total = 0, on = 0;
     for (int i = 0; i < n; i++) {
         if (fabsf(es[i].x) > 300 || fabsf(es[i].z) > 300 ||
             es[i].y < -100 || es[i].y > 500) continue;
-        float cx = m[0]*es[i].x + m[4]*es[i].y + m[8]*es[i].z  + m[12];
-        float cy = m[1]*es[i].x + m[5]*es[i].y + m[9]*es[i].z  + m[13];
-        float cw = m[3]*es[i].x + m[7]*es[i].y + m[11]*es[i].z + m[15];
+        float sx, sy, cw;
+        float bh = project_box(es[i].x, es[i].y, es[i].z, &sx, &sy, &cw);
         total++;
-        if (cw > 0.01f) {
-            float nx = cx / cw, ny = cy / cw;
-            if (fabsf(nx) <= 1.3f && fabsf(ny) <= 1.3f) on++;
-        }
+        if (bh > 0.0f && sx >= -40 && sx <= GAME_W + 40 && sy >= -80 && sy <= GAME_H + 80)
+            on++;
     }
+    memcpy(g_vp, save, sizeof(save));
     return (total >= 3 && on * 10 >= total * 6) ? on : -1;
 }
 
@@ -250,17 +270,6 @@ static bool scan_matrix(const Snap *es, int n) {
         addr += size;
     }
     return false;
-}
-
-static bool project(float x, float y, float z, float *sx, float *sy, float *cw) {
-    float cx = g_vp[0]*x + g_vp[4]*y + g_vp[8]*z  + g_vp[12];
-    float cy = g_vp[1]*x + g_vp[5]*y + g_vp[9]*z  + g_vp[13];
-    float w  = g_vp[3]*x + g_vp[7]*y + g_vp[11]*z + g_vp[15];
-    *cw = w;
-    if (w <= 0.001f) return false;   // behind camera
-    *sx = (cx / w * 0.5f + 0.5f) * GAME_W;
-    *sy = (1.0f - (cy / w * 0.5f + 0.5f)) * GAME_H;   // Y flip Unity -> view
-    return true;
 }
 
 // ---------------- worker thread ----------------
@@ -316,7 +325,7 @@ static void worker_loop(void) {
         if (!arr || size < 1 || size > 512) { g_list_off = -1; continue; }
 
         Snap snaps[MAX_ENTS];
-        int snap_n = 0, count = 0;
+        int snap_n = 0, count = 0, drawn = 0;
         float move_a = 0, move_b = 0;
         EspFrame f;
         memset(&f, 0, sizeof f);
@@ -329,7 +338,6 @@ static void worker_loop(void) {
             if (!rd_vec3(e + OFF_ENT_POS_A, pa)) continue;
             if (!rd_vec3(e + OFF_ENT_POS_B, pb)) continue;
 
-            // movement tracking — ALWAYS, before everything
             if (count < prev_n) {
                 move_a += fabsf(pa[0]-prev_a[count][0]) + fabsf(pa[2]-prev_a[count][2]);
                 move_b += fabsf(pb[0]-prev_b[count][0]) + fabsf(pb[2]-prev_b[count][2]);
@@ -337,7 +345,6 @@ static void worker_loop(void) {
             memcpy(prev_a[count], pa, 12);
             memcpy(prev_b[count], pb, 12);
 
-            // fill matrix-scan snapshot BEFORE any projection logic
             if (snap_n < MAX_ENTS) {
                 snaps[snap_n].x = (g_pos_sel == 0) ? pa[0] : pb[0];
                 snaps[snap_n].y = (g_pos_sel == 0) ? pa[1] : pb[1];
@@ -345,63 +352,70 @@ static void worker_loop(void) {
                 snap_n++;
             }
 
-            // reserve the slot — entity is COUNTED no matter what happens below
             EspEnt *en = &f.ents[count];
             en->hp      = rdi32(e + OFF_ENT_HP);
             en->hpmax   = rdi32(e + OFF_ENT_HPMAX);
             en->visible = rdi32(e + OFF_ENT_CANSIGHT);
-            en->dead    = (en->hp <= 0) || (rdi32(e + OFF_ENT_DEATH) != 0);
-            en->box_h   = 0; en->box_w = 0;
-            en->sx = 0; en->sy = 0;
+            en->dead    = (en->hp <= 0);   // v7: 0xD0 unverified — hp-only
+            en->sx = 0; en->sy = 0; en->box_h = 0; en->box_w = 0;
 
-            // select position candidate
             float fx = (g_pos_sel == 0) ? pa[0] : pb[0];
             float fy = (g_pos_sel == 0) ? pa[1] : pb[1];
             float fz = (g_pos_sel == 0) ? pa[2] : pb[2];
 
-            // world-space box sizing: project feet + head
-            float sfx, sfy, shx, shy, cwf, cwh;
-            bool okF = project(fx, fy, fz, &sfx, &sfy, &cwf);
-            bool okH = okF && project(fx, fy + HERO_H, fz, &shx, &shy, &cwh);
-
-            if (okF && okH) {
-                float bh = fabsf(sfy - shy);
-                if (bh >= 2.0f && bh <= 500.0f) {
-                    en->sx = sfx;
-                    en->sy = sfy;
-                    en->box_h = bh;
-                    en->box_w = bh * 0.55f;
-                }
+            float cw = 0;
+            float bh = project_box(fx, fy, fz, &en->sx, &en->sy, &cw);
+            if (bh > 0.0f) {
+                en->box_h = bh;
+                en->box_w = bh * 0.55f;
+                drawn++;
             }
-            // projection failed or degenerate -> box_h stays 0, renderer skips.
-            // Entity is still counted, snaps already filled, tracking intact.
+            // bh == 0 -> sx/sy may still be valid feet coords; renderer draws
+            // a debug dot for those so we always SEE projection state.
 
             count++;
         }
         prev_n = count;
 
-        // auto-select: frozen selected set + moving other set -> flip
         if (move_a < 0.01f && move_b > 0.5f && g_pos_sel == 0) {
-            g_pos_sel = 1; g_static_a_ticks = 0;
+            g_pos_sel = 1;
             mlog("auto-flip A->B (A frozen)");
         } else if (move_b < 0.01f && move_a > 0.5f && g_pos_sel == 1) {
-            g_pos_sel = 0; g_static_a_ticks = 0;
+            g_pos_sel = 0;
             mlog("auto-flip B->A (B frozen)");
         }
 
         if (!g_mat_ok && snap_n >= 3) g_mat_ok = scan_matrix(snaps, snap_n);
 
+        // rescan if matrix "ok" but nothing valid for ~1s (wrong matrix picked)
+        if (g_mat_ok && drawn == 0 && count > 0) {
+            if (++g_bad_box_ticks >= 10) {
+                g_mat_ok = false;
+                g_bad_box_ticks = 0;
+                mlog("matrix rejected: 0 valid boxes x10 ticks, rescanning");
+            }
+        } else g_bad_box_ticks = 0;
+
         f.matrix_ok = g_mat_ok ? 1 : 0;
         f.pos_sel   = (uint32_t)g_pos_sel;
-        f.entity_count = count;   // ALL heroes; renderer filters box_h==0
-        snprintf(f.status, sizeof f.status, "ents=%u mat=%s pos=%c",
-                 f.entity_count, g_mat_ok ? "ok" : "no", g_pos_sel ? 'B' : 'A');
+        f.entity_count = count;
+
+        // v7 debug: entity 0 raw numbers on the status line
+        if (count > 0) {
+            snprintf(f.status, sizeof f.status,
+                     "ents=%d dr=%d pos=%c | e0 sx=%.0f sy=%.0f bh=%.0f hp=%d",
+                     count, drawn, g_pos_sel ? 'B' : 'A',
+                     f.ents[0].sx, f.ents[0].sy, f.ents[0].box_h, f.ents[0].hp);
+        } else {
+            snprintf(f.status, sizeof f.status, "ents=0 pos=%c",
+                     g_pos_sel ? 'B' : 'A');
+        }
 
         os_unfair_lock_lock(&g_lock);
         g_frame = f;
         os_unfair_lock_unlock(&g_lock);
 
-        usleep(100000);   // 10 Hz
+        usleep(100000);
     }
 }
 
@@ -409,7 +423,7 @@ static void worker_loop(void) {
 struct EspCfg {
     bool esp_on, boxes, hp_bars, snaplines, vision_only, status_text;
 };
-static EspCfg g_cfg = { true, true, true, false, true, true };
+static EspCfg g_cfg = { true, true, true, true, false, true };
 
 // ---------------- overlay state ----------------
 static bool   g_menu_open = false;
@@ -496,36 +510,39 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
 
     ImDrawList *dl = ImGui::GetBackgroundDrawList();
 
-    // ALIVE marker (remove once ESP confirmed fully working)
-    dl->AddRectFilled(ImVec2(4, 4), ImVec2(24, 24), IM_COL32(255, 0, 0, 255));
-    dl->AddText(ImVec2(28, 8), IM_COL32(255, 60, 60, 255), "MLB ALIVE");
-
     if (g_cfg.esp_on && f.matrix_ok) {
         for (uint32_t i = 0; i < f.entity_count && i < MAX_ENTS; i++) {
             const EspEnt &e = f.ents[i];
-            if (e.box_h < 2.0f) continue;              // projection failed this tick
-            if (g_cfg.vision_only && !e.visible) continue;
             if (e.dead) continue;
 
-            float h = e.box_h, w = e.box_w;
-            float x0 = e.sx - w * 0.5f, y0 = e.sy - h;
-            float x1 = e.sx + w * 0.5f, y1 = e.sy;
-            ImU32 white = IM_COL32(255, 255, 255, 255);
+            // image-3 style colors
+            const ImU32 col_box  = IM_COL32(255, 165, 0, 255);   // orange
+            const ImU32 col_line = IM_COL32(255, 165, 0, 180);
+            const ImU32 col_hpbg = IM_COL32(0, 0, 0, 180);
+            const ImU32 col_hp   = IM_COL32(80, 220, 60, 255);   // green
 
-            if (g_cfg.boxes)
-                dl->AddRect(ImVec2(x0, y0), ImVec2(x1, y1), white, 0.0f, 0, 2.0f);
+            if (e.box_h >= 2.0f) {
+                float h = e.box_h, w = e.box_w;
+                float x0 = e.sx - w * 0.5f, y0 = e.sy - h;
+                float x1 = e.sx + w * 0.5f, y1 = e.sy;
 
-            if (g_cfg.hp_bars && e.hpmax > 0) {
-                float pct = (float)e.hp / (float)e.hpmax;
-                if (pct < 0) pct = 0; if (pct > 1) pct = 1;
-                float bx = x0 - 6.0f;
-                dl->AddRectFilled(ImVec2(bx, y0), ImVec2(bx + 3, y1), IM_COL32(20,20,20,200));
-                ImU32 col = IM_COL32((int)(255 * (1 - pct)), (int)(255 * pct), 0, 255);
-                dl->AddRectFilled(ImVec2(bx, y1 - (y1 - y0) * pct), ImVec2(bx + 3, y1), col);
+                if (g_cfg.boxes)
+                    dl->AddRect(ImVec2(x0, y0), ImVec2(x1, y1), col_box, 0.0f, 0, 2.0f);
+
+                if (g_cfg.hp_bars && e.hpmax > 0) {
+                    float pct = (float)e.hp / (float)e.hpmax;
+                    if (pct < 0) pct = 0; if (pct > 1) pct = 1;
+                    float bx = x0 - 7.0f;
+                    dl->AddRectFilled(ImVec2(bx - 1, y0 - 1), ImVec2(bx + 4, y1 + 1), col_hpbg);
+                    dl->AddRectFilled(ImVec2(bx, y1 - (y1 - y0) * pct), ImVec2(bx + 3, y1), col_hp);
+                }
+
+                if (g_cfg.snaplines)
+                    dl->AddLine(ImVec2(GAME_W * 0.5f, GAME_H), ImVec2(e.sx, y1), col_line, 1.2f);
+            } else if (e.sx != 0 || e.sy != 0) {
+                // projection of box failed but feet projected: debug dot
+                dl->AddCircleFilled(ImVec2(e.sx, e.sy), 3.0f, IM_COL32(255, 0, 255, 255));
             }
-
-            if (g_cfg.snaplines)
-                dl->AddLine(ImVec2(GAME_W * 0.5f, GAME_H), ImVec2(e.sx, y1), white, 1.0f);
         }
     }
 
@@ -548,8 +565,6 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
 
     if (g_cfg.status_text) {
         dl->AddText(ImVec2(8, 30), IM_COL32(0, 220, 255, 255), f.status);
-        if (!f.matrix_ok)
-            dl->AddText(ImVec2(8, 46), IM_COL32(255,200,0,255), "matrix: scanning...");
     }
 
     if (g_menu_open) {
@@ -594,7 +609,6 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
 @interface ESPWindow : UIWindow
 @end
 @implementation ESPWindow
-// never become key — the game's window keeps the responder chain
 - (BOOL)canBecomeKeyWindow { return NO; }
 
 - (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)e {
@@ -603,7 +617,7 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
     CGPoint local = [v convertPoint:p fromView:self];
     if (g_menu_open) return v;
     if (CGRectContainsPoint(g_btn_rect_v, local)) return v;
-    return nil;   // pass everything else through to the game
+    return nil;
 }
 @end
 
@@ -668,7 +682,7 @@ static void try_create(void) {
     objc_setAssociatedObject(v, "dl", dl, OBJC_ASSOCIATION_RETAIN);
 
     g_initialized = true;
-    mlog("overlay up (v6)");
+    mlog("overlay up (v7)");
 }
 
 static void create_loop(void) {
