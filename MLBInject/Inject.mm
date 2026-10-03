@@ -1,24 +1,11 @@
 // MLBInject — internal ESP for MLBB (arm64, injected via ElleKit/TrollFools)
-// Scene-aware window (iOS 13+). Opaque=NO compositing (game visible underneath).
-// Logs every stage to MLBB Documents/mlbesp_log.txt for Filza debugging.
-//
-// Offset provenance (verified via iGODGame disassembly):
-//   BM class slot 0x7BFBF70   <- Battle.ShowStrategyComp::get_battleManager
-//                                (adrp x19,#0x7bfb000; ldr x0,[x19,#0xf70])
-//   static_fields 0xA8        <- same fn (ldr x8,[x0,#0xa8])
-//   Instance static 0x0       <- same fn (ldr x0,[x8])
-//   Hp 0x1AC / HpMax 0x1B0    <- ShowEntity::get_m_HpPer (hp/hpmax*100)
-//   HpEstimate 0x270          <- get/set_m_HpEstimate (agree)
-//   CanSight 0x254            <- ShowEntity::get_m_CanSight
-//   Endure 0x278 (double)     <- ShowEntity::get_m_Endure
-//   Pos A 0x1D0 / Pos B 0x298 <- ShowEntity::get_Position tail paths
-//   LocalPlayer +0x50         <- LogicBattleManager::get_m_LocalPlayerLogic
-//   Camp 0x1EC                <- LogicFighter::get_m_EntityCampTypeReadOnly
-//   List candidate 0x198      <- BattleManager::GetAllEntities (auto-probed)
+// MANUAL Metal rendering: own CAMetalLayer + CADisplayLink, explicit drawable
+// acquisition and clear. No MTKView. Plus a plain-UIView red marker to split
+// window-vs-Metal diagnosis.
+// Logs to MLBB Documents/mlbesp_log.txt.
 
 #import <UIKit/UIKit.h>
 #import <Metal/Metal.h>
-#import <MetalKit/MetalKit.h>
 #import <QuartzCore/CAMetalLayer.h>
 #import <objc/runtime.h>
 #import <os/lock.h>
@@ -42,7 +29,7 @@ kern_return_t mach_vm_region(vm_map_t, mach_vm_address_t *, mach_vm_size_t *,
                         mach_msg_type_number_t *, mach_port_t *);
 }
 
-// ---------------- logging (stage tracking, Filza-readable) ----------------
+// ---------------- logging ----------------
 static void mlog(const char *fmt, ...) {
     static char path[512] = {0};
     if (!path[0]) {
@@ -73,19 +60,17 @@ static void mlog(const char *fmt, ...) {
 
 #define OFF_ENT_HP           0x1AC
 #define OFF_ENT_HPMAX        0x1B0
-#define OFF_ENT_HPEST        0x270
 #define OFF_ENT_CANSIGHT     0x254
-#define OFF_ENT_ENDURE       0x278
 #define OFF_ENT_POS_A        0x1D0
 #define OFF_ENT_POS_B        0x298
-#define OFF_ENT_DEATH        0xD0      // candidate; hp<=0 covers it
+#define OFF_ENT_DEATH        0xD0
 
 #define BOX_K                240.0f
 #define GAME_W               667.0f
 #define GAME_H               375.0f
 #define MAX_ENTS             64
 
-// ---------------- shared frame (worker -> renderer) ----------------
+// ---------------- shared frame ----------------
 typedef struct {
     float sx, sy, box_h, box_w;
     int32_t hp, hpmax, visible, dead;
@@ -156,12 +141,12 @@ static bool is_hero_obj(uint64_t obj) {
 }
 
 static bool list_valid(uint64_t lst) {
-    uint64_t arr  = rd64(lst + 0x10);          // List<T>._items
-    int32_t  size = rdi32(lst + 0x18);         // List<T>._size
+    uint64_t arr  = rd64(lst + 0x10);
+    int32_t  size = rdi32(lst + 0x18);
     if (!arr || size < 1 || size > 512) return false;
-    if (rdi32(arr + 0x18) != size) return false;  // array length must match
+    if (rdi32(arr + 0x18) != size) return false;
     for (int i = 0; i < size && i < 8; i++) {
-        uint64_t e = rd64(arr + 0x20 + 8ull * i);  // array data at 0x20
+        uint64_t e = rd64(arr + 0x20 + 8ull * i);
         if (!e) continue;
         uint64_t k = rd64(e);
         if (!k) continue;
@@ -259,9 +244,9 @@ static bool project(float x, float y, float z, float *sx, float *sy, float *cw) 
     float cy = g_vp[1]*x + g_vp[5]*y + g_vp[9]*z  + g_vp[13];
     float w  = g_vp[3]*x + g_vp[7]*y + g_vp[11]*z + g_vp[15];
     *cw = w;
-    if (w <= 0.001f) return false;   // behind camera
+    if (w <= 0.001f) return false;
     *sx = (cx / w * 0.5f + 0.5f) * GAME_W;
-    *sy = (1.0f - (cy / w * 0.5f + 0.5f)) * GAME_H;   // Y flip Unity -> view
+    *sy = (1.0f - (cy / w * 0.5f + 0.5f)) * GAME_H;
     return true;
 }
 
@@ -282,7 +267,6 @@ static void worker_loop(void) {
             mlog("UnityFramework @ 0x%llx", (unsigned long long)g_uf);
         }
 
-        // resolve BattleManager: slot -> class -> statics -> Instance
         uint64_t klass = rd64(g_uf + RVA_BM_CLASS_SLOT);
         char nm[64];
         if (!klass || !rd_cstr(rd64(klass + OFF_CLASS_NAME), nm, sizeof(nm)) ||
@@ -354,7 +338,6 @@ static void worker_loop(void) {
         }
         prev_n = count;
 
-        // auto-select position candidate: A frozen while B moves -> use B
         if (move_a < 0.01f && move_b > 0.5f) {
             if (++g_static_a_ticks >= 5) { g_pos_sel = 1; g_static_a_ticks = 0; }
         } else g_static_a_ticks = 0;
@@ -384,23 +367,25 @@ static void worker_loop(void) {
         g_frame = f;
         os_unfair_lock_unlock(&g_lock);
 
-        usleep(100000);   // 10 Hz
+        usleep(100000);
     }
 }
 
-// ---------------- config (in-memory) ----------------
+// ---------------- config ----------------
 struct EspCfg {
     bool esp_on, boxes, hp_bars, snaplines, vision_only, status_text;
     bool rot_right;
 };
 static EspCfg g_cfg = { true, true, true, false, true, true, true };
 
-// ---------------- overlay ----------------
+// ---------------- overlay state ----------------
 static bool   g_menu_open = false;
 static bool   g_initialized = false;
 static bool   g_logged_first_frame = false;
 static CGRect g_btn_rect_v = CGRectMake(GAME_W - 56, 8, 48, 48);
-static id<MTLCommandQueue> g_queue = nil;
+static id<MTLDevice>        g_dev = nil;
+static id<MTLCommandQueue>  g_queue = nil;
+static ImGuiContext        *g_imgui = nil;
 
 static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
     ImGuiIO &io = ImGui::GetIO();
@@ -409,49 +394,66 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
     io.AddMouseButtonEvent(0, down && !ended);
 }
 
-@interface ESPView : MTKView <MTKViewDelegate>
+// ---------------- MANUAL Metal view (no MTKView) ----------------
+@interface ESPMetalView : UIView
 @end
 
-@implementation ESPView
-- (void)touchesBegan:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e {
-    for (UITouch *t in ts) feed_touch(t, self, true, false);
-}
-- (void)touchesMoved:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e {
-    for (UITouch *t in ts) feed_touch(t, self, true, false);
-}
-- (void)touchesEnded:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e {
-    for (UITouch *t in ts) feed_touch(t, self, false, true);
-}
-- (void)touchesCancelled:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e {
-    for (UITouch *t in ts) feed_touch(t, self, false, true);
+@implementation ESPMetalView
++ (Class)layerClass { return [CAMetalLayer class]; }
+
+- (CAMetalLayer *)mlayer { return (CAMetalLayer *)self.layer; }
+
+- (void)configure:(id<MTLDevice>)dev {
+    CAMetalLayer *l = self.mlayer;
+    l.device = dev;
+    l.pixelFormat = MTLPixelFormatBGRA8Unorm;   // alpha-capable
+    l.opaque = NO;                              // transparent compositing
+    l.backgroundColor = NULL;
+    l.framebufferOnly = YES;
+    l.presentsWithTransaction = NO;
+    l.maximumDrawableCount = 2;
+    self.opaque = NO;
+    self.backgroundColor = [UIColor clearColor];
+    [self syncSize];
 }
 
-- (void)mtkView:(MTKView *)view drawableSizeWillChange:(CGSize)size {}
+- (void)syncSize {
+    CAMetalLayer *l = self.mlayer;
+    CGFloat scale = self.window.screen.scale ?: 2.0;
+    CGSize px = CGSizeMake(self.bounds.size.width * scale,
+                           self.bounds.size.height * scale);
+    if (l.drawableSize.width != px.width || l.drawableSize.height != px.height)
+        l.drawableSize = px;
+}
 
-- (void)drawInMTKView:(MTKView *)view {
-    if (!view.currentRenderPassDescriptor) return;
+- (void)drawFrame {
+    if (!g_initialized) return;
+    [self syncSize];
+
+    CAMetalLayer *l = self.mlayer;
+    id<CAMetalDrawable> d = [l nextDrawable];
+    if (!d) { static int nd=0; if(++nd==60) mlog("nextDrawable nil x60"); return; }
+
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = d.texture;
+    rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);  // transparent
 
     if (!g_logged_first_frame) {
         g_logged_first_frame = true;
-        mlog("first frame drawn (bounds %.0fx%.0f)",
-             view.bounds.size.width, view.bounds.size.height);
+        mlog("manual metal first frame (%.0fx%.0f px)",
+             l.drawableSize.width, l.drawableSize.height);
     }
 
-    static mach_timebase_info_data_t tb;
-    if (!tb.denom) mach_timebase_info(&tb);
-    static uint64_t last = 0;
-    uint64_t now = mach_absolute_time();
-    int dt_ms = last ? (int)((now - last) * tb.numer / tb.denom / 1000000ull) : 33;
-    last = now;
-
+    ImGui::SetCurrentContext(g_imgui);
     ImGuiIO &io = ImGui::GetIO();
-    io.DisplaySize = ImVec2(view.bounds.size.width, view.bounds.size.height);
-    io.DisplayFramebufferScale = ImVec2(
-        view.drawableSize.width  / view.bounds.size.width,
-        view.drawableSize.height / view.bounds.size.height);
-    io.DeltaTime = dt_ms > 0 ? dt_ms / 1000.0f : 1.0f / 30.0f;
+    io.DisplaySize = ImVec2(self.bounds.size.width, self.bounds.size.height);
+    io.DisplayFramebufferScale = ImVec2(l.drawableSize.width / self.bounds.size.width,
+                                        l.drawableSize.height / self.bounds.size.height);
+    io.DeltaTime = 1.0f / 30.0f;
 
-    ImGui_ImplMetal_NewFrame(view.currentRenderPassDescriptor);
+    ImGui_ImplMetal_NewFrame(rp);
     ImGui::NewFrame();
 
     EspFrame f;
@@ -461,7 +463,7 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
 
     ImDrawList *dl = ImGui::GetBackgroundDrawList();
 
-    // UNCONDITIONAL ALIVE marker — if the view renders, this is visible
+    // ImGui-side ALIVE marker (proves the Metal pipeline renders)
     dl->AddRectFilled(ImVec2(4, 4), ImVec2(24, 24), IM_COL32(255, 0, 0, 255));
     dl->AddText(ImVec2(28, 8), IM_COL32(255, 60, 60, 255), "MLB ALIVE");
 
@@ -493,7 +495,7 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
         }
     }
 
-    // floating toggle button
+    // toggle button
     ImGui::SetNextWindowPos(ImVec2(GAME_W - 56, 8));
     ImGui::PushStyleColor(ImGuiCol_WindowBg, 0);
     ImGui::Begin("##btn", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
@@ -526,44 +528,40 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
         ImGui::Checkbox("Vision only (safe)", &g_cfg.vision_only);
         ImGui::Checkbox("Status text",    &g_cfg.status_text);
         ImGui::Separator();
-        ImGui::Text("Orientation:");
-        if (ImGui::RadioButton("Landscape L", !g_cfg.rot_right)) g_cfg.rot_right = false;
-        ImGui::SameLine();
-        if (ImGui::RadioButton("Landscape R",  g_cfg.rot_right)) g_cfg.rot_right = true;
-        ImGui::Separator();
         ImGui::Text("ents: %u  mat: %s  pos: %c", f.entity_count,
                     f.matrix_ok ? "ok" : "no", f.pos_sel ? 'B' : 'A');
         ImGui::End();
-
-        CGFloat angle = g_cfg.rot_right ? -M_PI_2 : M_PI_2;
-        CGAffineTransform want = CGAffineTransformMakeRotation(angle);
-        if (view.transform.a != want.a || view.transform.b != want.b) {
-            UIScreen *scr = [UIScreen mainScreen];
-            view.bounds = CGRectMake(0, 0, GAME_W, GAME_H);
-            view.center = CGPointMake(scr.bounds.size.width * 0.5f, scr.bounds.size.height * 0.5f);
-            view.transform = want;
-        }
     }
 
     ImGui::Render();
 
     id<MTLCommandBuffer> cb = [g_queue commandBuffer];
-    id<MTLRenderCommandEncoder> enc =
-        [cb renderCommandEncoderWithDescriptor:view.currentRenderPassDescriptor];
+    id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
     ImGui_ImplMetal_RenderDrawData(ImGui::GetDrawData(), cb, enc);
     [enc endEncoding];
-    if (view.currentDrawable)
-        [cb presentDrawable:view.currentDrawable];
+    [cb presentDrawable:d];
     [cb commit];
+}
+
+- (void)touchesBegan:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e {
+    for (UITouch *t in ts) feed_touch(t, self, true, false);
+}
+- (void)touchesMoved:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e {
+    for (UITouch *t in ts) feed_touch(t, self, true, false);
+}
+- (void)touchesEnded:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e {
+    for (UITouch *t in ts) feed_touch(t, self, false, true);
+}
+- (void)touchesCancelled:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e {
+    for (UITouch *t in ts) feed_touch(t, self, false, true);
 }
 @end
 
 @interface ESPWindow : UIWindow
 @end
 @implementation ESPWindow
-// pass everything through to the game except the button + open menu
 - (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)e {
-    ESPView *v = (ESPView *)self.rootViewController.view;
+    ESPMetalView *v = (ESPMetalView *)self.rootViewController.view;
     if (!v) return nil;
     CGPoint local = [v convertPoint:p fromView:self];
     if (g_menu_open) return v;
@@ -572,7 +570,7 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
 }
 @end
 
-// ---------------- scene-aware creation (iOS 13+ requirement) ----------------
+// ---------------- scene-aware creation ----------------
 static UIWindow *g_win = nil;
 
 static UIWindowScene *find_scene(void) {
@@ -590,11 +588,12 @@ static void try_create(void) {
     UIWindowScene *scene = find_scene();
     if (!scene) return;
 
-    static bool logged_scene = false;
-    if (!logged_scene) { logged_scene = true; mlog("scene found, creating overlay"); }
+    static bool logged = false;
+    if (!logged) { logged = true; mlog("scene found, creating overlay"); }
 
-    id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
-    if (!dev) { mlog("ERROR: no Metal device"); return; }
+    g_dev = MTLCreateSystemDefaultDevice();
+    if (!g_dev) { mlog("ERROR: no Metal device"); return; }
+    g_queue = [g_dev newCommandQueue];
 
     g_win = [[UIWindow alloc] initWithWindowScene:scene];
     g_win.windowLevel = UIWindowLevelAlert + 100.0;
@@ -604,35 +603,42 @@ static void try_create(void) {
     g_win.rootViewController = [UIViewController new];
     g_win.rootViewController.view.backgroundColor = [UIColor clearColor];
 
-    g_queue = [dev newCommandQueue];
+    // diagnostic #1: plain UIView red square — no Metal involved
+    UIView *redSquare = [[UIView alloc] initWithFrame:CGRectMake(30, 30, 20, 20)];
+    redSquare.backgroundColor = [UIColor redColor];
+    redSquare.userInteractionEnabled = NO;
 
-    ESPView *v = [[ESPView alloc] initWithFrame:scene.screen.bounds device:dev];
-    v.delegate = v;
-    v.clearColor = MTLClearColorMake(0, 0, 0, 0);
-    v.preferredFramesPerSecond = 30;
-    v.enableSetNeedsDisplay = NO;
-    v.paused = NO;
-    v.backgroundColor = nil;
-    v.opaque = NO;                            // THE FIX: view must composite with alpha
-    ((CAMetalLayer *)v.layer).opaque = NO;    // layer too — opaque layer = black screen
+    // manual Metal view (landscape space, rotated)
+    ESPMetalView *v = [[ESPMetalView alloc] initWithFrame:CGRectMake(0, 0, GAME_W, GAME_H)];
+    [v configure:g_dev];
+
     g_win.rootViewController.view = v;
+    [g_win.rootViewController.view addSubview:redSquare];  // sits above Metal view
 
+    // ImGui context + backend
     IMGUI_CHECKVERSION();
-    ImGui::CreateContext();
+    g_imgui = ImGui::CreateContext();
     ImGui::GetIO().IniFilename = nullptr;
     ImGui::StyleColorsDark();
-    ImGui_ImplMetal_Init(dev);
+    ImGui_ImplMetal_Init(g_dev);
 
     UIScreen *scr = scene.screen;
-    v.bounds = CGRectMake(0, 0, GAME_W, GAME_H);
     v.center = CGPointMake(scr.bounds.size.width * 0.5f, scr.bounds.size.height * 0.5f);
     v.transform = CGAffineTransformMakeRotation(M_PI_2);
 
     g_win.hidden = NO;
     objc_setAssociatedObject(g_win, "keep", g_win, OBJC_ASSOCIATION_RETAIN);
+    objc_setAssociatedObject(redSquare, "keep", redSquare, OBJC_ASSOCIATION_RETAIN);
+
+    // drive rendering with CADisplayLink (main thread, 30fps)
+    CADisplayLink *dl = [CADisplayLink
+        displayLinkWithTarget:v selector:@selector(drawFrame)];
+    dl.preferredFramesPerSecond = 30;
+    [dl addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+    objc_setAssociatedObject(v, "dl", dl, OBJC_ASSOCIATION_RETAIN);
 
     g_initialized = true;
-    mlog("overlay up (scene-attached, transparent)");
+    mlog("overlay up (manual metal + display link)");
 }
 
 static void create_loop(void) {
