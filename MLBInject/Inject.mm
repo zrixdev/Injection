@@ -1,6 +1,21 @@
 // MLBInject — internal ESP for MLBB (arm64, injected via ElleKit/TrollFools)
-// v4: unrotated (in-process window is already landscape), non-key window
-// (touch pass-through), manual Metal + CADisplayLink, log to Documents.
+// v5: world-space box sizing (project feet + head) — scale-invariant,
+// no clipW dependency. Unrotated scene-attached window, non-key, manual
+// Metal + CADisplayLink, logs to MLBB Documents/mlbesp_log.txt.
+//
+// Offset provenance (verified via iGODGame disassembly):
+//   BM class slot 0x7BFBF70   <- Battle.ShowStrategyComp::get_battleManager
+//                                (adrp x19,#0x7bfb000; ldr x0,[x19,#0xf70])
+//   static_fields 0xA8        <- same fn (ldr x8,[x0,#0xa8])
+//   Instance static 0x0       <- same fn (ldr x0,[x8])
+//   Hp 0x1AC / HpMax 0x1B0    <- ShowEntity::get_m_HpPer (hp/hpmax*100)
+//   HpEstimate 0x270          <- get/set_m_HpEstimate (agree)
+//   CanSight 0x254            <- ShowEntity::get_m_CanSight
+//   Endure 0x278 (double)     <- ShowEntity::get_m_Endure
+//   Pos A 0x1D0 / Pos B 0x298 <- ShowEntity::get_Position tail paths
+//   LocalPlayer +0x50         <- LogicBattleManager::get_m_LocalPlayerLogic
+//   Camp 0x1EC                <- LogicFighter::get_m_EntityCampTypeReadOnly
+//   List candidate 0x198      <- BattleManager::GetAllEntities (auto-probed)
 
 #import <UIKit/UIKit.h>
 #import <Metal/Metal.h>
@@ -63,7 +78,7 @@ static void mlog(const char *fmt, ...) {
 #define OFF_ENT_POS_B        0x298
 #define OFF_ENT_DEATH        0xD0
 
-#define BOX_K                240.0f
+#define HERO_H               2.2f     // world-units hero height; tune 2.0-4.0
 #define GAME_W               667.0f
 #define GAME_H               375.0f
 #define MAX_ENTS             64
@@ -139,12 +154,12 @@ static bool is_hero_obj(uint64_t obj) {
 }
 
 static bool list_valid(uint64_t lst) {
-    uint64_t arr  = rd64(lst + 0x10);
-    int32_t  size = rdi32(lst + 0x18);
+    uint64_t arr  = rd64(lst + 0x10);          // List<T>._items
+    int32_t  size = rdi32(lst + 0x18);         // List<T>._size
     if (!arr || size < 1 || size > 512) return false;
-    if (rdi32(arr + 0x18) != size) return false;
+    if (rdi32(arr + 0x18) != size) return false;  // array length must match
     for (int i = 0; i < size && i < 8; i++) {
-        uint64_t e = rd64(arr + 0x20 + 8ull * i);
+        uint64_t e = rd64(arr + 0x20 + 8ull * i);  // array data at 0x20
         if (!e) continue;
         uint64_t k = rd64(e);
         if (!k) continue;
@@ -242,9 +257,9 @@ static bool project(float x, float y, float z, float *sx, float *sy, float *cw) 
     float cy = g_vp[1]*x + g_vp[5]*y + g_vp[9]*z  + g_vp[13];
     float w  = g_vp[3]*x + g_vp[7]*y + g_vp[11]*z + g_vp[15];
     *cw = w;
-    if (w <= 0.001f) return false;
+    if (w <= 0.001f) return false;   // behind camera
     *sx = (cx / w * 0.5f + 0.5f) * GAME_W;
-    *sy = (1.0f - (cy / w * 0.5f + 0.5f)) * GAME_H;
+    *sy = (1.0f - (cy / w * 0.5f + 0.5f)) * GAME_H;   // Y flip Unity -> view
     return true;
 }
 
@@ -313,6 +328,8 @@ static void worker_loop(void) {
             float pa[3] = {0}, pb[3] = {0};
             if (!rd_vec3(e + OFF_ENT_POS_A, pa) || !rd_vec3(e + OFF_ENT_POS_B, pb))
                 continue;
+
+            // track A/B movement BEFORE any projection guards
             if (count < prev_n) {
                 move_a += fabsf(pa[0]-prev_a[count][0]) + fabsf(pa[2]-prev_a[count][2]);
                 move_b += fabsf(pb[0]-prev_b[count][0]) + fabsf(pb[2]-prev_b[count][2]);
@@ -320,18 +337,34 @@ static void worker_loop(void) {
             memcpy(prev_a[count], pa, 12);
             memcpy(prev_b[count], pb, 12);
 
+            // select position candidate
+            float fx = (g_pos_sel == 0) ? pa[0] : pb[0];
+            float fy = (g_pos_sel == 0) ? pa[1] : pb[1];
+            float fz = (g_pos_sel == 0) ? pa[2] : pb[2];
+
+            // project feet + head (world height -> screen box, scale-invariant)
+            float sfx, sfy, shx, shy, cwf, cwh;
+            if (!project(fx, fy, fz, &sfx, &sfy, &cwf)) continue;          // feet
+            if (!project(fx, fy + HERO_H, fz, &shx, &shy, &cwh)) continue; // head
+
+            if (snap_n < MAX_ENTS) {
+                snaps[snap_n].x = fx; snaps[snap_n].y = fy; snaps[snap_n].z = fz;
+                snap_n++;
+            }
+
             EspEnt *en = &f.ents[count];
+            en->sx = sfx;                       // feet x
+            en->sy = sfy;                       // feet y (renderer draws y1 here)
+            en->box_h = fabsf(sfy - shy);       // feet->head screen distance
+            en->box_w = en->box_h * 0.55f;
             en->hp      = rdi32(e + OFF_ENT_HP);
             en->hpmax   = rdi32(e + OFF_ENT_HPMAX);
             en->visible = rdi32(e + OFF_ENT_CANSIGHT);
             en->dead    = (en->hp <= 0) || (rdi32(e + OFF_ENT_DEATH) != 0);
 
-            if (snap_n < MAX_ENTS) {
-                snaps[snap_n].x = (g_pos_sel == 0) ? pa[0] : pb[0];
-                snaps[snap_n].y = (g_pos_sel == 0) ? pa[1] : pb[1];
-                snaps[snap_n].z = (g_pos_sel == 0) ? pa[2] : pb[2];
-                snap_n++;
-            }
+            // reject degenerate boxes
+            if (en->box_h < 2.0f || en->box_h > 500.0f) continue;
+
             count++;
         }
         prev_n = count;
@@ -347,13 +380,7 @@ static void worker_loop(void) {
         f.entity_count = 0;
         if (g_mat_ok) {
             for (int i = 0; i < count; i++) {
-                float cw = 0;
-                if (project(snaps[i].x, snaps[i].y, snaps[i].z,
-                            &f.ents[i].sx, &f.ents[i].sy, &cw)) {
-                    f.ents[i].box_h = BOX_K / cw;
-                    f.ents[i].box_w = f.ents[i].box_h * 0.55f;
-                    f.ents[f.entity_count++] = f.ents[i];
-                }
+                f.ents[f.entity_count++] = f.ents[i];
             }
             snprintf(f.status, sizeof f.status, "ents=%u pos=%c",
                      f.entity_count, g_pos_sel ? 'B' : 'A');
@@ -365,11 +392,11 @@ static void worker_loop(void) {
         g_frame = f;
         os_unfair_lock_unlock(&g_lock);
 
-        usleep(100000);
+        usleep(100000);   // 10 Hz
     }
 }
 
-// ---------------- config ----------------
+// ---------------- config (in-memory) ----------------
 struct EspCfg {
     bool esp_on, boxes, hp_bars, snaplines, vision_only, status_text;
 };
@@ -408,7 +435,7 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
     l.backgroundColor = NULL;
     l.framebufferOnly = YES;
     l.presentsWithTransaction = NO;
-    l.maximumDrawableCount = 3;      // extra headroom: less nextDrawable blocking
+    l.maximumDrawableCount = 3;
     self.opaque = NO;
     self.backgroundColor = [UIColor clearColor];
     [self syncSize];
@@ -460,7 +487,7 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
 
     ImDrawList *dl = ImGui::GetBackgroundDrawList();
 
-    // ALIVE marker (remove once ESP confirmed working)
+    // ALIVE marker (remove once ESP confirmed fully working)
     dl->AddRectFilled(ImVec2(4, 4), ImVec2(24, 24), IM_COL32(255, 0, 0, 255));
     dl->AddText(ImVec2(28, 8), IM_COL32(255, 60, 60, 255), "MLB ALIVE");
 
@@ -608,8 +635,7 @@ static void try_create(void) {
     redSquare.backgroundColor = [UIColor redColor];
     redSquare.userInteractionEnabled = NO;
 
-    // unrotated, full-screen: the scene is ALREADY landscape (667x375 points
-    // on iPhone 8) — our ESP space maps 1:1 with no transform
+    // unrotated, full-screen: scene is already landscape — 1:1 mapping
     ESPMetalView *v = [[ESPMetalView alloc] initWithFrame:scene.screen.bounds];
     [v configure:g_dev];
 
@@ -633,7 +659,7 @@ static void try_create(void) {
     objc_setAssociatedObject(v, "dl", dl, OBJC_ASSOCIATION_RETAIN);
 
     g_initialized = true;
-    mlog("overlay up (unrotated, non-key, manual metal)");
+    mlog("overlay up (v5: world-space box sizing)");
 }
 
 static void create_loop(void) {
