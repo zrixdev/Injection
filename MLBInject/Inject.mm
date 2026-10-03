@@ -1,8 +1,6 @@
 // MLBInject — internal ESP for MLBB (arm64, injected via ElleKit/TrollFools)
-// MANUAL Metal rendering: own CAMetalLayer + CADisplayLink, explicit drawable
-// acquisition and clear. No MTKView. Plus a plain-UIView red marker to split
-// window-vs-Metal diagnosis.
-// Logs to MLBB Documents/mlbesp_log.txt.
+// v4: unrotated (in-process window is already landscape), non-key window
+// (touch pass-through), manual Metal + CADisplayLink, log to Documents.
 
 #import <UIKit/UIKit.h>
 #import <Metal/Metal.h>
@@ -291,7 +289,7 @@ static void worker_loop(void) {
             g_list_off = discover_list(bm);
             if (g_list_off < 0) {
                 EspFrame f; memset(&f, 0, sizeof f);
-                snprintf(f.status, sizeof f.status, "list not found yet");
+                snprintf(f.status, sizeof f.status, "list not found yet (enter a match)");
                 os_unfair_lock_lock(&g_lock); g_frame = f; os_unfair_lock_unlock(&g_lock);
                 usleep(500000); continue;
             }
@@ -374,9 +372,8 @@ static void worker_loop(void) {
 // ---------------- config ----------------
 struct EspCfg {
     bool esp_on, boxes, hp_bars, snaplines, vision_only, status_text;
-    bool rot_right;
 };
-static EspCfg g_cfg = { true, true, true, false, true, true, true };
+static EspCfg g_cfg = { true, true, true, false, true, true };
 
 // ---------------- overlay state ----------------
 static bool   g_menu_open = false;
@@ -394,7 +391,7 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
     io.AddMouseButtonEvent(0, down && !ended);
 }
 
-// ---------------- MANUAL Metal view (no MTKView) ----------------
+// ---------------- MANUAL Metal view ----------------
 @interface ESPMetalView : UIView
 @end
 
@@ -406,12 +403,12 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
 - (void)configure:(id<MTLDevice>)dev {
     CAMetalLayer *l = self.mlayer;
     l.device = dev;
-    l.pixelFormat = MTLPixelFormatBGRA8Unorm;   // alpha-capable
-    l.opaque = NO;                              // transparent compositing
+    l.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    l.opaque = NO;
     l.backgroundColor = NULL;
     l.framebufferOnly = YES;
     l.presentsWithTransaction = NO;
-    l.maximumDrawableCount = 2;
+    l.maximumDrawableCount = 3;      // extra headroom: less nextDrawable blocking
     self.opaque = NO;
     self.backgroundColor = [UIColor clearColor];
     [self syncSize];
@@ -438,7 +435,7 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
     rp.colorAttachments[0].texture = d.texture;
     rp.colorAttachments[0].loadAction = MTLLoadActionClear;
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
-    rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);  // transparent
+    rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
 
     if (!g_logged_first_frame) {
         g_logged_first_frame = true;
@@ -463,7 +460,7 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
 
     ImDrawList *dl = ImGui::GetBackgroundDrawList();
 
-    // ImGui-side ALIVE marker (proves the Metal pipeline renders)
+    // ALIVE marker (remove once ESP confirmed working)
     dl->AddRectFilled(ImVec2(4, 4), ImVec2(24, 24), IM_COL32(255, 0, 0, 255));
     dl->AddText(ImVec2(28, 8), IM_COL32(255, 60, 60, 255), "MLB ALIVE");
 
@@ -560,13 +557,16 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
 @interface ESPWindow : UIWindow
 @end
 @implementation ESPWindow
+// never become key — the game's window keeps the responder chain
+- (BOOL)canBecomeKeyWindow { return NO; }
+
 - (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)e {
     ESPMetalView *v = (ESPMetalView *)self.rootViewController.view;
     if (!v) return nil;
     CGPoint local = [v convertPoint:p fromView:self];
     if (g_menu_open) return v;
     if (CGRectContainsPoint(g_btn_rect_v, local)) return v;
-    return nil;
+    return nil;   // pass everything else through to the game
 }
 @end
 
@@ -595,7 +595,7 @@ static void try_create(void) {
     if (!g_dev) { mlog("ERROR: no Metal device"); return; }
     g_queue = [g_dev newCommandQueue];
 
-    g_win = [[UIWindow alloc] initWithWindowScene:scene];
+    g_win = [[ESPWindow alloc] initWithWindowScene:scene];
     g_win.windowLevel = UIWindowLevelAlert + 100.0;
     g_win.opaque = NO;
     g_win.backgroundColor = [UIColor clearColor];
@@ -603,34 +603,29 @@ static void try_create(void) {
     g_win.rootViewController = [UIViewController new];
     g_win.rootViewController.view.backgroundColor = [UIColor clearColor];
 
-    // diagnostic #1: plain UIView red square — no Metal involved
+    // diagnostic red square (no Metal) — remove once ESP confirmed
     UIView *redSquare = [[UIView alloc] initWithFrame:CGRectMake(30, 30, 20, 20)];
     redSquare.backgroundColor = [UIColor redColor];
     redSquare.userInteractionEnabled = NO;
 
-    // manual Metal view (landscape space, rotated)
-    ESPMetalView *v = [[ESPMetalView alloc] initWithFrame:CGRectMake(0, 0, GAME_W, GAME_H)];
+    // unrotated, full-screen: the scene is ALREADY landscape (667x375 points
+    // on iPhone 8) — our ESP space maps 1:1 with no transform
+    ESPMetalView *v = [[ESPMetalView alloc] initWithFrame:scene.screen.bounds];
     [v configure:g_dev];
 
     g_win.rootViewController.view = v;
-    [g_win.rootViewController.view addSubview:redSquare];  // sits above Metal view
+    [g_win.rootViewController.view addSubview:redSquare];
 
-    // ImGui context + backend
     IMGUI_CHECKVERSION();
     g_imgui = ImGui::CreateContext();
     ImGui::GetIO().IniFilename = nullptr;
     ImGui::StyleColorsDark();
     ImGui_ImplMetal_Init(g_dev);
 
-    UIScreen *scr = scene.screen;
-    v.center = CGPointMake(scr.bounds.size.width * 0.5f, scr.bounds.size.height * 0.5f);
-    v.transform = CGAffineTransformMakeRotation(M_PI_2);
-
     g_win.hidden = NO;
     objc_setAssociatedObject(g_win, "keep", g_win, OBJC_ASSOCIATION_RETAIN);
     objc_setAssociatedObject(redSquare, "keep", redSquare, OBJC_ASSOCIATION_RETAIN);
 
-    // drive rendering with CADisplayLink (main thread, 30fps)
     CADisplayLink *dl = [CADisplayLink
         displayLinkWithTarget:v selector:@selector(drawFrame)];
     dl.preferredFramesPerSecond = 30;
@@ -638,7 +633,7 @@ static void try_create(void) {
     objc_setAssociatedObject(v, "dl", dl, OBJC_ASSOCIATION_RETAIN);
 
     g_initialized = true;
-    mlog("overlay up (manual metal + display link)");
+    mlog("overlay up (unrotated, non-key, manual metal)");
 }
 
 static void create_loop(void) {
