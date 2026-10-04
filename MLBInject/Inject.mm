@@ -1,35 +1,21 @@
 // MLBInject — internal ESP for MLBB (arm64, injected via ElleKit/TrollFools)
-// v20: patch set from external review + NEXRA fixes.
-//   PATCH 1: HERO_H 2.2f -> 4.5f (bigger boxes; un-gates far entities that
-//            projected under the 2px minimum — fixes ents=5 drawn=3 gap)
-//   PATCH 2: per-entity dump every ~2s (names which filter eats a missing ent)
-//   PATCH 3: throttled LOCAL log (validates BM+0x50 against minimap position)
-//   PATCH 4: PENDING — LogicBattleManager+0xA0 fallback waits on the LBM
-//            class slot RVA from the other build
-//   FIX B1:  EspFrame.pos_sel added (renderer referenced a nonexistent member)
-//   FIX B2:  removed `if (addr < size) return false;` in scan_matrix — on iOS
-//            the first region is __PAGEZERO (0..4GB) so the scanner bailed
-//            before reading a single byte
-//   FIX B3:  VP address cache — on stale matrix, re-check last-found slot
-//            first (one read) instead of a full 1-3s cold resweep every time
-//            the camera moves
+// v21: matrix quality + local auto-probe build.
+//   MATRIX: strict scoring (box height must be 15-400px on >=70% of ents) —
+//           kills degenerate matrices that projected heroes 3px tall.
+//           Best-candidate adoption + resumable sweep cursor. Manual
+//           "force rescan" button in menu as escape hatch.
+//   REVALIDATION: loosened (2+ ents plausible in generous bounds) so camera
+//           pans / heroes going off-screen don't trigger false "stale".
+//   LOCAL: BM+0x50 is DEAD on this build (loc=no confirmed). Auto-probe
+//           walks candidate BM offsets, scores by screen-centrality over
+//           time (camera centers on local hero), locks after 8 stable
+//           ticks. Fallback: snaplines draw from screen bottom-center
+//           until local resolves.
+//   POS MODE: menu button cycles auto/A/B — quick test if boxes land
+//           offset from heroes (pos A vs B question).
+//   DUMP: skip counters (not-hero / no-pos) + list size vs matched count.
 //
-// Baseline (proven v11/v19 session): no il2cpp calls, memory-scan matrix with
-// per-tick revalidation, projection in worker thread, renderer draws.
-//   - feet+head world-space box sizing (scale-invariant)
-//   - local player via BattleManager+0x50 (m_LocalPlayerShow) -> CYAN box;
-//     snaplines local hero -> enemy box CENTERS
-//   - degenerate-matrix guards (zero X-row, sx-spread)
-//   - pos A/B auto-flip, dead=hp-only, vision filter client-side (default off)
-//   - landscape gate + orientation resync, non-key window
-//
-// Data offsets (verified via iGODGame disassembly):
-//   BM class slot 0x7BFBF70 / statics 0xA8 / Instance 0x0  <- get_battleManager
-//   Hp 0x1AC / HpMax 0x1B0  <- get_m_HpPer
-//   CanSight 0x254          <- get_m_CanSight
-//   Pos A 0x1D0 / Pos B 0x298 <- get_Position tail paths (B verified live)
-//   Local player: BM+0x50 (m_LocalPlayerShow — runtime-validated, PATCH 3 log)
-//   List: auto-probe (locks BM+0x78 m_ShowPlayers)
+// Carried from v20: HERO_H 4.5f, VP slot cache, pos_sel fix, PAGEZERO fix.
 
 #import <UIKit/UIKit.h>
 #import <Metal/Metal.h>
@@ -90,10 +76,8 @@ static void mlog(const char *fmt, ...) {
 #define OFF_ENT_CANSIGHT     0x254
 #define OFF_ENT_POS_A        0x1D0
 #define OFF_ENT_POS_B        0x298
-#define OFF_BM_LOCALSHOW     0x50      // m_LocalPlayerShow (old dump, validated)
+#define OFF_BM_LOCALSHOW     0x50      // dead on this build; kept as probe cand
 
-// PATCH 1: was 2.2f — far heroes projected under the 2px box gate and got
-// silently skipped. Tune: too tall -> 3.8, too short -> 5.5.
 #define HERO_H               4.5f
 #define MAX_ENTS             64
 
@@ -111,10 +95,13 @@ typedef struct {
 typedef struct {
     uint32_t entity_count;
     uint32_t matrix_ok;
-    int32_t  pos_sel;                 // FIX B1: 0=A, 1=B (renderer reads this)
-    int32_t  local_ok;                // BM+0x50 probe succeeded
+    int32_t  pos_sel;
+    int32_t  pos_mode;                // 0=auto 1=A 2=B (display)
+    int32_t  mat_score;               // strict score at adoption
+    int32_t  local_ok;
+    int32_t  local_off;               // resolved BM offset, -1 none
     float    local_sx, local_sy, local_bh;
-    int32_t  local_drawn;             // local hero projected on-screen
+    int32_t  local_drawn;
     char     status[160];
     EspEnt   ents[MAX_ENTS];
 } EspFrame;
@@ -151,7 +138,8 @@ static uint64_t uf_base(void) {
 static uint64_t g_uf = 0;
 static int      g_list_off = -1;
 static int      g_pos_sel = 1;
-static uint64_t g_last_vp_addr = 0;   // FIX B3: cached VP slot for fast re-check
+static int      g_pos_mode = 0;          // 0=auto 1=force A 2=force B
+static uint64_t g_last_vp_addr = 0;
 
 typedef struct KlassCache { uint64_t obj; bool hero; } KlassCache;
 static KlassCache g_kcache[512];
@@ -174,8 +162,8 @@ static bool is_hero_obj(uint64_t obj) {
 }
 
 static bool list_valid(uint64_t lst) {
-    uint64_t arr  = rd64(lst + 0x10);          // List<T>._items
-    int32_t  size = rdi32(lst + 0x18);         // List<T>._size
+    uint64_t arr  = rd64(lst + 0x10);
+    int32_t  size = rdi32(lst + 0x18);
     if (!arr || size < 1 || size > 512) return false;
     if (rdi32(arr + 0x18) != size) return false;
     for (int i = 0; i < size && i < 8; i++) {
@@ -203,22 +191,22 @@ static int discover_list(uint64_t bm) {
     return -1;
 }
 
-// ---------------- projection (the math from the WORKING session) --------
+// ---------------- projection ----------------
 static float g_vp[16];
 static bool  g_mat_ok = false;
+static int   g_adopt_score = 0;
 
 static bool project(float x, float y, float z, float *sx, float *sy, float *cw) {
     float cx = g_vp[0]*x + g_vp[4]*y + g_vp[8]*z  + g_vp[12];
     float cy = g_vp[1]*x + g_vp[5]*y + g_vp[9]*z  + g_vp[13];
     float w  = g_vp[3]*x + g_vp[7]*y + g_vp[11]*z + g_vp[15];
     *cw = w;
-    if (w <= 0.001f) return false;   // behind camera
+    if (w <= 0.001f) return false;
     *sx = (cx / w * 0.5f + 0.5f) * g_screen_w;
-    *sy = (1.0f - (cy / w * 0.5f + 0.5f)) * g_screen_h;   // Y flip Unity -> view
+    *sy = (1.0f - (cy / w * 0.5f + 0.5f)) * g_screen_h;
     return true;
 }
 
-// feet+head pair projection; returns screen box height, 0 on failure
 static float project_box(float x, float y, float z,
                          float *sx, float *sy, float *cw_out) {
     float sfx, sfy, shx, shy, cwf, cwh;
@@ -231,11 +219,14 @@ static float project_box(float x, float y, float z,
     return bh;
 }
 
-// ---------------- matrix scanner (the one that WORKED) ----------------
+// ---------------- matrix scanner ----------------
 typedef struct Snap { float x, y, z; } Snap;
 
+// STRICT score — used for discovery/adoption. A candidate only counts an
+// entity if its box height is 15-400px (MLBB camera is fixed-zoom; heroes
+// are always in that band on a real view-projection matrix). Degenerate
+// matrices (bh=3 like your screenshot) score 0 and lose.
 static int vp_score(const float m[16], const Snap *es, int n) {
-    // degenerate guards (v9b): zero X row pins sx to center
     if (fabsf(m[0]) + fabsf(m[4]) + fabsf(m[8]) < 1e-4f) return -1;
 
     float save[16];
@@ -249,23 +240,46 @@ static int vp_score(const float m[16], const Snap *es, int n) {
         float sx, sy, cw;
         float bh = project_box(es[i].x, es[i].y, es[i].z, &sx, &sy, &cw);
         total++;
-        if (bh > 0.0f &&
+        if (bh >= 15.0f && bh <= 400.0f &&
             sx >= -g_screen_w*0.1f && sx <= g_screen_w*1.1f &&
             sy >= -g_screen_h*0.2f && sy <= g_screen_h*1.2f)
             on++;
     }
     memcpy(g_vp, save, sizeof(save));
-    return (total >= 3 && on * 10 >= total * 6) ? on : -1;
+    return (total >= 3 && on * 10 >= total * 7) ? on : -1;
 }
 
-static bool scan_region_for_vp(uint64_t addr, uint64_t len,
+// LOOSE revalidation — only checks the current matrix still makes sense.
+// Generous bounds + lower height bar, needs just 2 sane ents. Camera pans
+// and off-screen heroes must NOT trigger constant rescans.
+static bool vp_revalidate(const Snap *es, int n) {
+    int total = 0, on = 0;
+    for (int i = 0; i < n; i++) {
+        if (fabsf(es[i].x) > 300 || fabsf(es[i].z) > 300 ||
+            es[i].y < -100 || es[i].y > 500) continue;
+        float sx, sy, cw;
+        float bh = project_box(es[i].x, es[i].y, es[i].z, &sx, &sy, &cw);
+        total++;
+        if (bh >= 10.0f && bh <= 500.0f &&
+            sx >= -g_screen_w*0.5f && sx <= g_screen_w*1.5f &&
+            sy >= -g_screen_h*0.5f && sy <= g_screen_h*1.5f)
+            on++;
+    }
+    return total >= 3 && on >= 2;
+}
+
+static float    g_best_vp[16];
+static uint64_t g_best_addr = 0;
+static int      g_best_score = 0;
+
+static void scan_region_for_vp(uint64_t addr, uint64_t len,
                                const Snap *es, int n) {
     static uint8_t buf[256 * 1024 + 64];
     const uint64_t chunk = 256 * 1024;
     for (uint64_t off = 0; off < len; off += chunk) {
         uint64_t want = chunk + 64;
         if (off + want > len) want = len - off;
-        if (!rd(addr + off, buf, want)) continue;   // unreadable -> skip chunk
+        if (!rd(addr + off, buf, want)) continue;
         for (uint64_t o = 0; o + 64 <= chunk && off + o + 64 <= want; o += 16) {
             const float *m = (const float *)(buf + o);
             if (!(m[15] != 0.0f && (fabsf(m[3]) + fabsf(m[7]) + fabsf(m[11])) > 1e-6f))
@@ -274,62 +288,95 @@ static bool scan_region_for_vp(uint64_t addr, uint64_t len,
             for (int i = 0; i < 16; i++)
                 if (!(fabsf(m[i]) < 1e9f)) { finite = false; break; }
             if (!finite) continue;
-            if (vp_score(m, es, n) > 0) {
-                memcpy(g_vp, m, sizeof(g_vp));
-                g_last_vp_addr = addr + off + o;    // FIX B3: remember the slot
+            int sc = vp_score(m, es, n);
+            if (sc > g_best_score) {
+                g_best_score = sc;
+                memcpy(g_best_vp, m, sizeof(g_best_vp));
+                g_best_addr = addr + off + o;
+                if (sc >= n) return;   // perfect — stop early
+            }
+        }
+    }
+}
+
+// Resumable sweep: cursor persists across calls, so a stale matrix resumes
+// near where the last sweep stopped instead of restarting from zero.
+static bool scan_matrix(const Snap *es, int n) {
+    // fast path: camera usually rewrites VP into the same slot.
+    // strict score required, must be >= adoption score.
+    if (g_last_vp_addr) {
+        float m[16];
+        if (rd(g_last_vp_addr, m, sizeof m)) {
+            int sc = vp_score(m, es, n);
+            if (sc > 0 && sc >= g_adopt_score) {
+                memcpy(g_vp, m, sizeof g_vp);
+                g_adopt_score = sc;
                 return true;
             }
         }
     }
-    return false;
-}
 
-static bool scan_matrix(const Snap *es, int n) {
-    // FIX B3 fast path: camera rewrites VP into the same buffer slot almost
-    // every time — one read beats a 1-3s cold sweep
-    if (g_last_vp_addr) {
-        float m[16];
-        if (rd(g_last_vp_addr, m, sizeof m) && vp_score(m, es, n) > 0) {
-            memcpy(g_vp, m, sizeof g_vp);
-            return true;
-        }
-    }
+    static mach_vm_address_t cursor = 1;
+    static bool wrapped = false;
+    g_best_score = 0;
 
-    mach_vm_address_t addr = 1;
-    uint64_t budget = 64ull * 1024 * 1024;   // per-tick budget; continues next tick
+    uint64_t budget = 64ull * 1024 * 1024;
     while (budget > 0) {
+        mach_vm_address_t addr = cursor;
         mach_vm_size_t size = 0;
         vm_region_basic_info_data_64_t info;
         mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
         mach_port_t obj = MACH_PORT_NULL;
         kern_return_t kr = mach_vm_region(mach_task_self(), &addr, &size,
                 VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &cnt, &obj);
-        if (kr != KERN_SUCCESS) return false;
+        if (kr != KERN_SUCCESS) {
+            if (!wrapped) { wrapped = true; cursor = 1; continue; }
+            break;
+        }
         if (obj) mach_port_deallocate(mach_task_self(), obj);
-        // FIX B2: removed `if (addr < size) return false;` — first region on
-        // iOS is __PAGEZERO (0..4GB), so this bailed before scanning anything
+        cursor = addr + size;
 
         if ((info.protection & VM_PROT_READ) &&
             !(info.protection & VM_PROT_EXECUTE) &&
             size <= 512ull * 1024 * 1024) {
-            if (scan_region_for_vp(addr, size, es, n)) return true;
-            budget = (size < budget) ? budget - size : 0;
+            scan_region_for_vp(addr, size, es, n);
+            if (g_best_score >= n) break;
         }
-        addr += size;
+        budget = (size < budget) ? budget - size : 0;
+    }
+
+    if (g_best_score > 0 && g_best_score >= g_adopt_score) {
+        memcpy(g_vp, g_best_vp, sizeof g_vp);
+        g_last_vp_addr = g_best_addr;
+        g_adopt_score  = g_best_score;
+        cursor = (g_best_addr + 64);   // next rescan continues past this slot
+        wrapped = false;
+        mlog("matrix ADOPTED score=%d @ 0x%llx", g_best_score,
+             (unsigned long long)g_best_addr);
+        return true;
     }
     return false;
 }
 
-// ---------------- worker thread: data + scan + projection ----------------
+// ---------------- worker thread ----------------
 static void worker_loop(void) {
     static float prev_a[MAX_ENTS][3], prev_b[MAX_ENTS][3];
     static int prev_n = 0;
     static uint64_t probe_bm = 0;
     static bool probe_logged = false, probe_fail_logged = false;
     static int rescans = 0;
-
-    // PATCH 2: entity dump throttle (~every 2s at 10Hz)
     static int dbg_tick = 0;
+
+    // ---- local auto-probe state ----
+    // camera centers on the local hero, so the correct BM offset is the one
+    // whose ShowPlayer keeps projecting nearest screen center over time.
+    static const int lcands[] = { 0x50, 0x58, 0x60, 0x68, 0x70, 0x78, 0x80,
+        0x88, 0x90, 0x98, 0xA0, 0xA8, 0xB0, 0xB8, 0xC0, 0xC8, 0xD0, 0xD8,
+        0xE0, 0xE8, 0xF0, 0xF8, 0x100, 0x108 };
+    static const int nl = (int)(sizeof(lcands) / sizeof(lcands[0]));
+    static float lacc[nl]; static int ln[nl];
+    static int lbest_prev = -1, lbest_run = 0;
+    static int g_local_off = -1;
 
     for (;;) {
         if (!g_uf) {
@@ -352,7 +399,9 @@ static void worker_loop(void) {
             os_unfair_lock_lock(&g_lock); g_frame = f; os_unfair_lock_unlock(&g_lock);
             g_list_off = -1; g_mat_ok = false; g_kcache_n = 0;
             g_pos_sel = 1; g_uf = 0;
-            g_last_vp_addr = 0;               // FIX B3: slot is dead after lobby
+            g_last_vp_addr = 0; g_adopt_score = 0;
+            g_local_off = -1; lbest_prev = -1; lbest_run = 0;
+            memset(lacc, 0, sizeof lacc); memset(ln, 0, sizeof ln);
             sleep(1); continue;
         }
         uint64_t statics = rd64(klass + OFF_CLASS_STATICS);
@@ -362,7 +411,9 @@ static void worker_loop(void) {
             snprintf(f.status, sizeof f.status, "lobby (no battle instance)");
             os_unfair_lock_lock(&g_lock); g_frame = f; os_unfair_lock_unlock(&g_lock);
             g_list_off = -1; g_mat_ok = false; g_kcache_n = 0; g_pos_sel = 1;
-            g_last_vp_addr = 0;
+            g_last_vp_addr = 0; g_adopt_score = 0;
+            g_local_off = -1; lbest_prev = -1; lbest_run = 0;
+            memset(lacc, 0, sizeof lacc); memset(ln, 0, sizeof ln);
             usleep(500000); continue;
         }
         if (g_list_off < 0) {
@@ -374,31 +425,42 @@ static void worker_loop(void) {
                 usleep(500000); continue;
             }
         }
-        if (probe_bm != bm) { probe_bm = bm; probe_logged = false; probe_fail_logged = false; }
+        if (probe_bm != bm) {
+            probe_bm = bm; probe_logged = false; probe_fail_logged = false;
+            g_local_off = -1; lbest_prev = -1; lbest_run = 0;
+            memset(lacc, 0, sizeof lacc); memset(ln, 0, sizeof ln);
+        }
 
         uint64_t lst = rd64(bm + g_list_off);
         uint64_t arr = lst ? rd64(lst + 0x10) : 0;
         int32_t  size = lst ? rdi32(lst + 0x18) : 0;
         if (!arr || size < 1 || size > 512) { g_list_off = -1; continue; }
 
+        int sel = (g_pos_mode == 0) ? g_pos_sel : (g_pos_mode - 1);
+
         Snap snaps[MAX_ENTS];
         int snap_n = 0, count = 0;
+        int skip_not_hero = 0, skip_nopos = 0;
         float move_a = 0, move_b = 0;
         EspFrame f;
         memset(&f, 0, sizeof f);
 
-        // PATCH 2: dump buffer
         bool dbg = (++dbg_tick % 20) == 0;
-        char dbgbuf[1024] = {0};
+        char dbgbuf[1280] = {0};
         int dbgoff = 0;
+
+        if (dbg)
+            dbgoff += snprintf(dbgbuf, sizeof(dbgbuf),
+                "ents dump: list size=%d pos=%c\n", size, sel ? 'B' : 'A');
 
         for (int32_t i = 0; i < size && count < MAX_ENTS; i++) {
             uint64_t e = rd64(arr + 0x20 + 8ull * (uint64_t)i);
-            if (!e || !is_hero_obj(e)) continue;
+            if (!e || !is_hero_obj(e)) { skip_not_hero++; continue; }
 
             float pa[3] = {0}, pb[3] = {0};
-            if (!rd_vec3(e + OFF_ENT_POS_A, pa)) continue;
-            if (!rd_vec3(e + OFF_ENT_POS_B, pb)) continue;
+            if (!rd_vec3(e + OFF_ENT_POS_A, pa) || !rd_vec3(e + OFF_ENT_POS_B, pb)) {
+                skip_nopos++; continue;
+            }
 
             if (count < prev_n) {
                 move_a += fabsf(pa[0]-prev_a[count][0]) + fabsf(pa[2]-prev_a[count][2]);
@@ -408,16 +470,16 @@ static void worker_loop(void) {
             memcpy(prev_b[count], pb, 12);
 
             if (snap_n < MAX_ENTS) {
-                snaps[snap_n].x = (g_pos_sel == 0) ? pa[0] : pb[0];
-                snaps[snap_n].y = (g_pos_sel == 0) ? pa[1] : pb[1];
-                snaps[snap_n].z = (g_pos_sel == 0) ? pa[2] : pb[2];
+                snaps[snap_n].x = (sel == 0) ? pa[0] : pb[0];
+                snaps[snap_n].y = (sel == 0) ? pa[1] : pb[1];
+                snaps[snap_n].z = (sel == 0) ? pa[2] : pb[2];
                 snap_n++;
             }
 
             EspEnt *en = &f.ents[count];
-            float fx = (g_pos_sel == 0) ? pa[0] : pb[0];
-            float fy = (g_pos_sel == 0) ? pa[1] : pb[1];
-            float fz = (g_pos_sel == 0) ? pa[2] : pb[2];
+            float fx = (sel == 0) ? pa[0] : pb[0];
+            float fy = (sel == 0) ? pa[1] : pb[1];
+            float fz = (sel == 0) ? pa[2] : pb[2];
             en->hp      = rdi32(e + OFF_ENT_HP);
             en->hpmax   = rdi32(e + OFF_ENT_HPMAX);
             en->visible = rdi32(e + OFF_ENT_CANSIGHT);
@@ -431,8 +493,7 @@ static void worker_loop(void) {
                 en->box_w = bh * 0.55f;
             }
 
-            // PATCH 2: per-entity dump line
-            if (dbg && dbgoff < (int)sizeof(dbgbuf) - 128)
+            if (dbg && dbgoff < (int)sizeof(dbgbuf) - 160)
                 dbgoff += snprintf(dbgbuf + dbgoff, sizeof(dbgbuf) - dbgoff,
                     "[%d] hp=%d/%d bh=%.0f sx=%.0f sy=%.0f vis=%d dead=%d\n",
                     count, en->hp, en->hpmax, en->box_h, en->sx, en->sy,
@@ -442,19 +503,24 @@ static void worker_loop(void) {
         }
         prev_n = count;
 
-        if (dbg && dbgoff) mlog("ents dump:\n%s", dbgbuf);
+        if (dbg)
+            mlog("%smatched=%d skipNH=%d skipNP=%d\n%s",
+                 dbgbuf, count, skip_not_hero, skip_nopos,
+                 count ? "" : "(no ents matched)");
 
-        if (move_a < 0.01f && move_b > 0.5f && g_pos_sel == 0) {
-            g_pos_sel = 1;
-            mlog("auto-flip A->B (A frozen)");
-        } else if (move_b < 0.01f && move_a > 0.5f && g_pos_sel == 1) {
-            g_pos_sel = 0;
-            mlog("auto-flip B->A (B frozen)");
+        if (g_pos_mode == 0) {
+            if (move_a < 0.01f && move_b > 0.5f && g_pos_sel == 0) {
+                g_pos_sel = 1;
+                mlog("auto-flip A->B (A frozen)");
+            } else if (move_b < 0.01f && move_a > 0.5f && g_pos_sel == 1) {
+                g_pos_sel = 0;
+                mlog("auto-flip B->A (B frozen)");
+            }
         }
 
-        // ---- matrix: revalidate every tick, rescan immediately when stale ----
+        // ---- matrix: loose revalidate, strict rescan ----
         if (g_mat_ok && snap_n >= 3) {
-            if (vp_score(g_vp, snaps, snap_n) <= 0) {
+            if (!vp_revalidate(snaps, snap_n)) {
                 g_mat_ok = false;
                 mlog("matrix stale — rescanning (#%d)", ++rescans);
             }
@@ -466,62 +532,120 @@ static void worker_loop(void) {
             }
         }
 
-        // ---- local player probe: BM+0x50 = m_LocalPlayerShow (validated) ----
+        // ---- local player: auto-probe BM offsets by screen centrality ----
         f.local_ok = 0;
         f.local_drawn = 0;
-        uint64_t lshow = rd64(bm + OFF_BM_LOCALSHOW);
-        if (lshow && is_hero_obj(lshow)) {
-            float la[3] = {0}, lb[3] = {0};
-            if (rd_vec3(lshow + OFF_ENT_POS_A, la) && rd_vec3(lshow + OFF_ENT_POS_B, lb)) {
-                float lx = (g_pos_sel == 0) ? la[0] : lb[0];
-                float ly = (g_pos_sel == 0) ? la[1] : lb[1];
-                float lz = (g_pos_sel == 0) ? la[2] : lb[2];
-                f.local_ok = 1;
-                if (g_mat_ok) {
-                    float cw = 0;
-                    float bh = project_box(lx, ly, lz, &f.local_sx, &f.local_sy, &cw);
-                    if (bh >= 2.0f && bh <= 2000.0f) {
-                        f.local_bh = bh;
-                        f.local_drawn = 1;
-                    }
-                }
-                if (!probe_logged) {
-                    probe_logged = true;
-                    mlog("local player via BM+0x50: ShowPlayer @ 0x%llx",
-                         (unsigned long long)lshow);
-                }
+        f.local_off = -1;
 
-                // PATCH 3: throttled LOCAL verification log — compare wp
-                // against your minimap position. Mismatch = BM+0x50 wrong
-                // for this build -> switch to LogicBattleManager+0xA0 path
-                static int local_log_tick = 0;
-                if ((++local_log_tick % 20) == 1) {
-                    mlog("LOCAL: ptr=0x%llx wp=(%.1f,%.1f,%.1f) sx=%.0f sy=%.0f drawn=%d",
-                         (unsigned long long)lshow, lx, ly, lz,
-                         f.local_sx, f.local_sy, f.local_drawn);
+        uint64_t lshow = 0;
+        int loff_used = -1;
+
+        if (g_local_off > 0) {
+            uint64_t p = rd64(bm + g_local_off);
+            if (p && is_hero_obj(p)) { lshow = p; loff_used = g_local_off; }
+            else { g_local_off = -1; lbest_prev = -1; lbest_run = 0; }
+        }
+
+        if (g_mat_ok && snap_n >= 3 && g_local_off < 0) {
+            float cx = g_screen_w * 0.5f, cy = g_screen_h * 0.5f;
+            int best = -1; float bestd = 1e9f;
+            for (int i = 0; i < nl; i++) {
+                if (lcands[i] == g_list_off) continue;
+                uint64_t p = rd64(bm + lcands[i]);
+                if (!p || !is_hero_obj(p)) { lacc[i] = 0; ln[i] = 0; continue; }
+                float la[3] = {0}, lb[3] = {0};
+                if (!rd_vec3(p + OFF_ENT_POS_A, la) || !rd_vec3(p + OFF_ENT_POS_B, lb)) {
+                    lacc[i] = 0; ln[i] = 0; continue;
+                }
+                float lx = (sel == 0) ? la[0] : lb[0];
+                float ly = (sel == 0) ? la[1] : lb[1];
+                float lz = (sel == 0) ? la[2] : lb[2];
+                float sx, sy, cw;
+                float bh = project_box(lx, ly, lz, &sx, &sy, &cw);
+                if (bh < 10.0f ||
+                    sx < -g_screen_w*0.2f || sx > g_screen_w*1.2f ||
+                    sy < -g_screen_h*0.2f || sy > g_screen_h*1.2f) {
+                    lacc[i] *= 0.7f; continue;   // decay, don't zero — panning
+                }
+                float d = fabsf(sx - cx) + fabsf(sy - cy);
+                lacc[i] = lacc[i] * 0.9f + d;
+                ln[i]++;
+                if (ln[i] >= 3) {
+                    float avg = lacc[i] / (float)ln[i];
+                    if (avg < bestd) { bestd = avg; best = i; }
+                }
+            }
+            if (best >= 0) {
+                if (best == lbest_prev) lbest_run++;
+                else { lbest_prev = best; lbest_run = 1; }
+                if (lbest_run >= 8 && ln[best] >= 6) {
+                    g_local_off = lcands[best];
+                    mlog("local LOCKED @ BM+0x%x (avg dist %.0f)",
+                         g_local_off, lacc[best] / (float)ln[best]);
+                }
+            } else { lbest_prev = -1; lbest_run = 0; }
+        }
+
+        if (lshow || (g_local_off > 0)) {
+            if (!lshow) {
+                uint64_t p = rd64(bm + g_local_off);
+                if (p && is_hero_obj(p)) { lshow = p; loff_used = g_local_off; }
+            }
+            if (lshow) {
+                float la[3] = {0}, lb[3] = {0};
+                if (rd_vec3(lshow + OFF_ENT_POS_A, la) && rd_vec3(lshow + OFF_ENT_POS_B, lb)) {
+                    float lx = (sel == 0) ? la[0] : lb[0];
+                    float ly = (sel == 0) ? la[1] : lb[1];
+                    float lz = (sel == 0) ? la[2] : lb[2];
+                    f.local_ok = 1;
+                    f.local_off = loff_used;
+                    if (g_mat_ok) {
+                        float cw = 0;
+                        float bh = project_box(lx, ly, lz, &f.local_sx, &f.local_sy, &cw);
+                        if (bh >= 2.0f && bh <= 2000.0f) {
+                            f.local_bh = bh;
+                            f.local_drawn = 1;
+                        }
+                    }
+                    if (!probe_logged) {
+                        probe_logged = true;
+                        mlog("local ShowPlayer @ 0x%llx via BM+0x%x",
+                             (unsigned long long)lshow, loff_used);
+                    }
+                    static int local_log_tick = 0;
+                    if ((++local_log_tick % 20) == 1) {
+                        mlog("LOCAL: off=0x%x ptr=0x%llx wp=(%.1f,%.1f,%.1f) sx=%.0f sy=%.0f drawn=%d",
+                             loff_used, (unsigned long long)lshow, lx, ly, lz,
+                             f.local_sx, f.local_sy, f.local_drawn);
+                    }
                 }
             }
         }
         if (!f.local_ok && !probe_fail_logged && count > 0) {
             probe_fail_logged = true;
-            mlog("BM+0x50 probe failed (ptr=%llx)", (unsigned long long)lshow);
+            mlog("local unresolved (BM+0x50 ptr=%llx) — probing / fallback origin",
+                 (unsigned long long)rd64(bm + OFF_BM_LOCALSHOW));
         }
 
         f.matrix_ok = g_mat_ok ? 1 : 0;
-        f.pos_sel   = g_pos_sel;          // FIX B1
+        f.mat_score = g_adopt_score;
+        f.pos_sel   = sel;
+        f.pos_mode  = g_pos_mode;
         f.entity_count = count;
-        snprintf(f.status, sizeof f.status, "ents=%d mat=%s pos=%c",
-                 count, g_mat_ok ? "ok" : "scan", g_pos_sel ? 'B' : 'A');
+        snprintf(f.status, sizeof f.status, "ents=%d mat=%s(%d) pos=%c loc=%s",
+                 count, g_mat_ok ? "ok" : "scan", g_adopt_score,
+                 sel ? 'B' : 'A',
+                 f.local_ok ? (f.local_drawn ? "scr" : "ptr") : "no");
 
         os_unfair_lock_lock(&g_lock);
         g_frame = f;
         os_unfair_lock_unlock(&g_lock);
 
-        usleep(100000);   // 10 Hz
+        usleep(100000);
     }
 }
 
-// ---------------- config (in-memory) ----------------
+// ---------------- config ----------------
 struct EspCfg {
     bool esp_on, boxes, hp_bars, snaplines, vision_only, status_text;
 };
@@ -578,7 +702,6 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
 - (void)drawFrame {
     if (!g_initialized) return;
 
-    // orientation re-sync (~2x/sec)
     static int _sync = 0;
     if ((++_sync % 15) == 0) {
         UIWindowScene *scn = find_scene();
@@ -632,13 +755,17 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
     ImDrawList *dl = ImGui::GetBackgroundDrawList();
 
     if (g_cfg.esp_on && f.matrix_ok) {
-        const ImU32 col_box   = IM_COL32(255, 165, 0, 255);   // orange
+        const ImU32 col_box   = IM_COL32(255, 165, 0, 255);
         const ImU32 col_line  = IM_COL32(255, 165, 0, 180);
         const ImU32 col_hpbg  = IM_COL32(0, 0, 0, 180);
         const ImU32 col_hp    = IM_COL32(80, 220, 60, 255);
-        const ImU32 col_local = IM_COL32(0, 220, 255, 255);   // cyan = YOU
+        const ImU32 col_local = IM_COL32(0, 220, 255, 255);
 
-        // entity boxes (only drawn when this tick's matrix was validated)
+        // snapline origin: local hero if resolved, else screen bottom-center
+        float ox, oy;
+        if (f.local_drawn) { ox = f.local_sx; oy = f.local_sy; }
+        else { ox = io.DisplaySize.x * 0.5f; oy = io.DisplaySize.y; }
+
         for (uint32_t i = 0; i < f.entity_count && i < MAX_ENTS; i++) {
             const EspEnt &e = f.ents[i];
             if (e.dead) continue;
@@ -660,13 +787,11 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
                 dl->AddRectFilled(ImVec2(bx, y1 - (y1 - y0) * pct), ImVec2(bx + 3, y1), col_hp);
             }
 
-            // snapline: YOUR hero -> box CENTER
-            if (g_cfg.snaplines && f.local_drawn)
-                dl->AddLine(ImVec2(f.local_sx, f.local_sy),
+            if (g_cfg.snaplines)
+                dl->AddLine(ImVec2(ox, oy),
                             ImVec2(e.sx, e.sy - e.box_h * 0.5f), col_line, 1.2f);
         }
 
-        // YOUR hero: cyan box (from BM+0x50 projection)
         if (f.local_drawn) {
             float w = f.local_bh * 0.55f, h = f.local_bh;
             float x0 = f.local_sx - w * 0.5f, y0 = f.local_sy - h;
@@ -696,10 +821,10 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
     if (g_cfg.status_text) {
         char st[192];
         snprintf(st, sizeof st,
-                 "ents=%u mat=%s pos=%c loc=%s | e0 sx=%.0f sy=%.0f bh=%.0f hp=%d",
-                 f.entity_count, f.matrix_ok ? "ok" : "scan",
+                 "ents=%u mat=%s(%d) pos=%c loc=%s | e0 sx=%.0f sy=%.0f bh=%.0f hp=%d",
+                 f.entity_count, f.matrix_ok ? "ok" : "scan", f.mat_score,
                  f.pos_sel ? 'B' : 'A',
-                 f.local_ok ? (f.local_drawn ? "ptr+scr" : "ptr") : "no",
+                 f.local_ok ? (f.local_drawn ? "scr" : "ptr") : "no",
                  f.entity_count ? f.ents[0].sx : 0.f,
                  f.entity_count ? f.ents[0].sy : 0.f,
                  f.entity_count ? f.ents[0].box_h : 0.f,
@@ -716,6 +841,15 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
         ImGui::Checkbox("Snaplines",      &g_cfg.snaplines);
         ImGui::Checkbox("Vision only (safe)", &g_cfg.vision_only);
         ImGui::Checkbox("Status text",    &g_cfg.status_text);
+
+        const char *pm = (f.pos_mode == 0) ? "pos: auto" : (f.pos_mode == 1) ? "pos: force A" : "pos: force B";
+        if (ImGui::Button(pm)) g_pos_mode = (g_pos_mode + 1) % 3;
+        if (ImGui::Button("Force matrix rescan")) {
+            g_mat_ok = false;
+            g_adopt_score = 0;
+            g_last_vp_addr = 0;
+            mlog("manual rescan requested from menu");
+        }
         ImGui::End();
     }
 
@@ -823,7 +957,7 @@ static void try_create(void) {
     objc_setAssociatedObject(v, "dl", dl, OBJC_ASSOCIATION_RETAIN);
 
     g_initialized = true;
-    mlog("overlay up (v20 patch-build)");
+    mlog("overlay up (v21 matrix-quality + local-probe)");
 }
 
 static void create_loop(void) {
@@ -839,7 +973,7 @@ static void create_loop(void) {
 
 __attribute__((constructor))
 static void mlb_inject_ctor(void) {
-    mlog("=== ctor fired: VERSION 20 BUILD (patch set: HERO_H + dumps + LOCAL log + VP cache) ===");
+    mlog("=== ctor fired: VERSION 21 BUILD (strict matrix + local probe + pos mode) ===");
     create_loop();
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         sleep(3);
