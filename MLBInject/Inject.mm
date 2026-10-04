@@ -1,7 +1,9 @@
 // MLBInject — internal ESP for MLBB (arm64, injected via ElleKit/TrollFools)
-// v7: robust matrix validation (feet+head sanity), dead=hp-only (0xD0 unverified),
-// per-entity debug readout in status, image-3 style (orange boxes/HP/snaplines),
-// rescan on persistent invalid boxes. Manual Metal + CADisplayLink, non-key window.
+// v8: screen dims taken from the live scene (no hardcoded 667x375 assumption),
+// corrected Y mapping (+0.0f — Unity NDC is already bottom-up), carried-over
+// v7 wins: dead=hp-only, snaps-before-projection, per-tick debug status,
+// matrix validated with the same feet+head math as runtime, auto-rescan,
+// image-3 style orange boxes / green HP / orange snaplines.
 //
 // Offset provenance (verified via iGODGame disassembly):
 //   BM class slot 0x7BFBF70 / statics 0xA8 / Instance 0x0  <- get_battleManager
@@ -71,9 +73,11 @@ static void mlog(const char *fmt, ...) {
 #define OFF_ENT_POS_B        0x298
 
 #define HERO_H               2.2f     // world-units hero height; tune 2.0-4.0
-#define GAME_W               667.0f
-#define GAME_H               375.0f
 #define MAX_ENTS             64
+
+// live screen dims (points) — filled from the scene at overlay creation
+static float g_screen_w = 667.0f;
+static float g_screen_h = 375.0f;
 
 // ---------------- shared frame ----------------
 typedef struct {
@@ -176,14 +180,16 @@ static int discover_list(uint64_t bm) {
 }
 
 // ---------------- projection ----------------
+// Uses LIVE screen dims. If MLBB's matrix targets pixel space, everything
+// scales linearly and g_screen_w/h just absorbs it (validation adapts too).
 static bool project(float x, float y, float z, float *sx, float *sy, float *cw) {
     float cx = g_vp[0]*x + g_vp[4]*y + g_vp[8]*z  + g_vp[12];
     float cy = g_vp[1]*x + g_vp[5]*y + g_vp[9]*z  + g_vp[13];
     float w  = g_vp[3]*x + g_vp[7]*y + g_vp[11]*z + g_vp[15];
     *cw = w;
     if (w <= 0.001f) return false;   // behind camera
-    *sx = (cx / w * 0.5f + 0.5f) * GAME_W;
-    *sy = (1.0f - (cy / w * 0.5f + 0.5f)) * GAME_H;   // Y flip Unity -> view
+    *sx = (cx / w * 0.5f + 0.5f) * g_screen_w;
+    *sy = (1.0f - (cy / w * 0.5f + 0.0f)) * g_screen_h;   // no double flip
     return true;
 }
 
@@ -215,7 +221,9 @@ static int vp_score(const float m[16], const Snap *es, int n) {
         float sx, sy, cw;
         float bh = project_box(es[i].x, es[i].y, es[i].z, &sx, &sy, &cw);
         total++;
-        if (bh > 0.0f && sx >= -40 && sx <= GAME_W + 40 && sy >= -80 && sy <= GAME_H + 80)
+        if (bh > 0.0f &&
+            sx >= -g_screen_w*0.1f && sx <= g_screen_w*1.1f &&
+            sy >= -g_screen_h*0.2f && sy <= g_screen_h*1.2f)
             on++;
     }
     memcpy(g_vp, save, sizeof(save));
@@ -372,8 +380,6 @@ static void worker_loop(void) {
                 en->box_w = bh * 0.55f;
                 drawn++;
             }
-            // bh==0 -> sx/sy may still hold valid feet coords; renderer draws
-            // a magenta debug dot for those so projection state is always visible.
 
             count++;
         }
@@ -390,7 +396,7 @@ static void worker_loop(void) {
 
         if (!g_mat_ok && snap_n >= 3) g_mat_ok = scan_matrix(snaps, snap_n);
 
-        // rescan if matrix "ok" but nothing valid for ~1s (wrong matrix picked)
+        // rescan if matrix "ok" but nothing valid for ~1s (wrong/stale matrix)
         if (g_mat_ok && drawn == 0 && count > 0) {
             if (++g_bad_box_ticks >= 10) {
                 g_mat_ok = false;
@@ -403,7 +409,7 @@ static void worker_loop(void) {
         f.pos_sel   = (uint32_t)g_pos_sel;
         f.entity_count = count;
 
-        // v7 debug: entity 0 raw numbers on the status line
+        // v8 debug: entity 0 raw numbers on the status line
         if (count > 0) {
             snprintf(f.status, sizeof f.status,
                      "ents=%d dr=%d pos=%c | e0 sx=%.0f sy=%.0f bh=%.0f hp=%d",
@@ -432,7 +438,7 @@ static EspCfg g_cfg = { true, true, true, true, false, true };
 static bool   g_menu_open = false;
 static bool   g_initialized = false;
 static bool   g_logged_first_frame = false;
-static CGRect g_btn_rect_v = CGRectMake(GAME_W - 56, 8, 48, 48);
+static CGRect g_btn_rect_v = CGRectMake(611.0f, 8, 48, 48);   // top-right in landscape pts
 static id<MTLDevice>        g_dev = nil;
 static id<MTLCommandQueue>  g_queue = nil;
 static ImGuiContext        *g_imgui = nil;
@@ -541,7 +547,8 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
                 }
 
                 if (g_cfg.snaplines)
-                    dl->AddLine(ImVec2(GAME_W * 0.5f, GAME_H), ImVec2(e.sx, y1), col_line, 1.2f);
+                    dl->AddLine(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y),
+                                ImVec2(e.sx, y1), col_line, 1.2f);
             } else if (e.sx != 0 || e.sy != 0) {
                 // box projection failed but feet projected: magenta debug dot
                 dl->AddCircleFilled(ImVec2(e.sx, e.sy), 3.0f, IM_COL32(255, 0, 255, 255));
@@ -549,8 +556,8 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
         }
     }
 
-    // toggle button
-    ImGui::SetNextWindowPos(ImVec2(GAME_W - 56, 8));
+    // toggle button — anchored to the LIVE display size, top-right
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 56, 8));
     ImGui::PushStyleColor(ImGuiCol_WindowBg, 0);
     ImGui::Begin("##btn", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
                  ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoBackground |
@@ -565,6 +572,7 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
     }
     ImGui::End();
     ImGui::PopStyleColor();
+    g_btn_rect_v = CGRectMake(io.DisplaySize.x - 56, 8, 48, 48);
 
     if (g_cfg.status_text) {
         dl->AddText(ImVec2(8, 30), IM_COL32(0, 220, 255, 255), f.status);
@@ -580,8 +588,9 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
         ImGui::Checkbox("Vision only (safe)", &g_cfg.vision_only);
         ImGui::Checkbox("Status text",    &g_cfg.status_text);
         ImGui::Separator();
-        ImGui::Text("ents: %u  mat: %s  pos: %c", f.entity_count,
-                    f.matrix_ok ? "ok" : "no", f.pos_sel ? 'B' : 'A');
+        ImGui::Text("ents: %u  mat: %s  pos: %c  |  e0: %.0f,%.0f b%.0f", f.entity_count,
+                    f.matrix_ok ? "ok" : "no", f.pos_sel ? 'B' : 'A',
+                    f.ents[0].sx, f.ents[0].sy, f.ents[0].box_h);
         ImGui::End();
     }
 
@@ -658,17 +667,16 @@ static void try_create(void) {
     g_win.rootViewController = [UIViewController new];
     g_win.rootViewController.view.backgroundColor = [UIColor clearColor];
 
-    // diagnostic red square (no Metal) — remove once ESP confirmed
-    UIView *redSquare = [[UIView alloc] initWithFrame:CGRectMake(30, 30, 20, 20)];
-    redSquare.backgroundColor = [UIColor redColor];
-    redSquare.userInteractionEnabled = NO;
+    // LIVE screen dims — replaces all hardcoded 667x375 assumptions
+    CGRect sb = scene.screen.bounds;
+    g_screen_w = (float)sb.size.width;
+    g_screen_h = (float)sb.size.height;
+    mlog("screen pts: %.0f x %.0f", g_screen_w, g_screen_h);
 
-    // unrotated, full-screen: the scene is ALREADY landscape — 1:1 mapping
-    ESPMetalView *v = [[ESPMetalView alloc] initWithFrame:scene.screen.bounds];
+    ESPMetalView *v = [[ESPMetalView alloc] initWithFrame:sb];
     [v configure:g_dev];
 
     g_win.rootViewController.view = v;
-    [g_win.rootViewController.view addSubview:redSquare];
 
     IMGUI_CHECKVERSION();
     g_imgui = ImGui::CreateContext();
@@ -678,7 +686,6 @@ static void try_create(void) {
 
     g_win.hidden = NO;
     objc_setAssociatedObject(g_win, "keep", g_win, OBJC_ASSOCIATION_RETAIN);
-    objc_setAssociatedObject(redSquare, "keep", redSquare, OBJC_ASSOCIATION_RETAIN);
 
     CADisplayLink *dl = [CADisplayLink
         displayLinkWithTarget:v selector:@selector(drawFrame)];
@@ -687,7 +694,7 @@ static void try_create(void) {
     objc_setAssociatedObject(v, "dl", dl, OBJC_ASSOCIATION_RETAIN);
 
     g_initialized = true;
-    mlog("overlay up (v7)");
+    mlog("overlay up (v8)");
 }
 
 static void create_loop(void) {
@@ -703,7 +710,7 @@ static void create_loop(void) {
 
 __attribute__((constructor))
 static void mlb_inject_ctor(void) {
-    mlog("=== ctor fired: VERSION 7 BUILD ===");
+    mlog("=== ctor fired: VERSION 8 BUILD ===");
     create_loop();
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         sleep(3);
