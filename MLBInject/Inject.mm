@@ -1,17 +1,16 @@
 // MLBInject — internal ESP for MLBB (arm64, injected via ElleKit/TrollFools)
-// v9b: DEGENERATE MATRIX REJECTION — scanner was picking float blocks with a
-// zero X-row (sx pinned to screen center, constant box height). vp_score now
-// rejects zero-X-row blocks AND requires projected sx to spread across the
-// screen (real cameras spread entities; degenerate ones pin them). Runtime
-// adds the same spread check -> auto rescan. Status now shows e0 WORLD coords.
-// Carried: landscape gate + resync, dead=hp-only, snaps-before-projection,
-// orange boxes / green HP / orange snaplines.
+// v11: STRICT matrix validation + per-tick revalidation. Positions verified
+// real (e0 traces spawn->mid lane correctly). Scanner demands: ALL entities
+// on-screen, sx spread >=30%, sy spread >=15%, bh spread >=20% (perspective),
+// and the cached matrix must keep passing EVERY tick (camera follows hero ->
+// stale matrices fail instantly -> auto rescan). Unreadable chunks no longer
+// abort a region scan. Budget 256MB/tick. All v9b fixes carried.
 //
 // Offset provenance (verified via iGODGame disassembly):
 //   BM class slot 0x7BFBF70 / statics 0xA8 / Instance 0x0  <- get_battleManager
 //   Hp 0x1AC / HpMax 0x1B0  <- get_m_HpPer
 //   CanSight 0x254          <- get_m_CanSight
-//   Pos A 0x1D0 / Pos B 0x298 <- get_Position tail paths
+//   Pos A 0x1D0 / Pos B 0x298 <- get_Position tail paths (B verified live)
 //   List: auto-probe (locks BM+0x78 m_ShowPlayers)
 
 #import <UIKit/UIKit.h>
@@ -84,7 +83,7 @@ static UIWindowScene *find_scene(void);
 
 // ---------------- shared frame ----------------
 typedef struct {
-    float wx, wy, wz;                 // world feet (selected pos set)
+    float wx, wy, wz;
     float sx, sy, box_h, box_w;
     int32_t hp, hpmax, visible, dead;
 } EspEnt;
@@ -109,13 +108,11 @@ static bool rd(uint64_t addr, void *out, size_t len) {
 static uint64_t rd64(uint64_t a)  { uint64_t v = 0; return rd(a, &v, 8) ? v : 0; }
 static int32_t  rdi32(uint64_t a) { int32_t  v = 0; return rd(a, &v, 4) ? v : 0; }
 static bool rd_vec3(uint64_t a, float o[3]) { return rd(a, o, 12); }
-
 static bool rd_cstr(uint64_t addr, char *out, size_t cap) {
     if (!addr || !rd(addr, out, cap)) return false;
     out[cap - 1] = 0;
     return out[0] != 0;
 }
-
 static uint64_t uf_base(void) {
     for (uint32_t i = 0; i < _dyld_image_count(); i++) {
         const char *n = _dyld_get_image_name(i);
@@ -131,7 +128,7 @@ static float    g_vp[16];
 static bool     g_mat_ok = false;
 static int      g_list_off = -1;
 static int      g_pos_sel = 1;
-static int      g_bad_box_ticks = 0;
+static int      g_rescans = 0;
 
 typedef struct KlassCache { uint64_t obj; bool hero; } KlassCache;
 static KlassCache g_kcache[512];
@@ -207,21 +204,26 @@ static float project_box(float x, float y, float z,
     return bh;
 }
 
-// ---------------- camera matrix scan ----------------
+// ---------------- strict matrix validation ----------------
 typedef struct Snap { float x, y, z; } Snap;
 
-// v9b: reject degenerate matrices:
-//  (a) zero/near-zero X row  -> every sx pins to screen center
-//  (b) projected sx spread < 15% of screen for spread-out world points
-static int vp_score(const float m[16], const Snap *es, int n) {
-    if (fabsf(m[0]) + fabsf(m[4]) + fabsf(m[8]) < 1e-4f) return -1;   // (a)
+struct VScore {
+    int   onscreen;   // entities projecting fully on-screen with valid box
+    float sx_spread, sy_spread, bh_spread;
+    bool  pass;
+};
+
+static VScore vp_score(const float m[16], const Snap *es, int n) {
+    VScore r = {0,0,0,0,false};
+    if (fabsf(m[0]) + fabsf(m[4]) + fabsf(m[8]) < 1e-4f) return r;   // zero X row
+    if (fabsf(m[1]) + fabsf(m[5]) + fabsf(m[9]) < 1e-4f) return r;   // zero Y row
 
     float save[16];
     memcpy(save, g_vp, sizeof(save));
     memcpy(g_vp, m, sizeof(save));
 
-    float sxs[MAX_ENTS];
-    int total = 0, on = 0, sn = 0;
+    float sxs[MAX_ENTS], sys[MAX_ENTS], bhs[MAX_ENTS];
+    int sn = 0, total = 0;
     for (int i = 0; i < n && sn < MAX_ENTS; i++) {
         if (fabsf(es[i].x) > 300 || fabsf(es[i].z) > 300 ||
             es[i].y < -100 || es[i].y > 500) continue;
@@ -229,23 +231,32 @@ static int vp_score(const float m[16], const Snap *es, int n) {
         float bh = project_box(es[i].x, es[i].y, es[i].z, &sx, &sy, &cw);
         total++;
         if (bh > 0.0f &&
-            sx >= -g_screen_w*0.1f && sx <= g_screen_w*1.1f &&
-            sy >= -g_screen_h*0.2f && sy <= g_screen_h*1.2f) {
-            sxs[sn++] = sx;
-            on++;
+            sx >= 0 && sx <= g_screen_w && sy >= 0 && sy <= g_screen_h) {
+            sxs[sn] = sx; sys[sn] = sy; bhs[sn] = bh; sn++;
         }
     }
     memcpy(g_vp, save, sizeof(save));
 
-    if (sn >= 3) {                                                    // (b)
-        float mn = 1e9f, mx = -1e9f;
-        for (int k = 0; k < sn; k++) {
-            if (sxs[k] < mn) mn = sxs[k];
-            if (sxs[k] > mx) mx = sxs[k];
-        }
-        if (mx - mn < g_screen_w * 0.15f) return -1;
+    r.onscreen = sn;
+    if (sn < 3 || total < 3) return r;
+
+    float sxmn=1e9f, sxmx=-1e9f, symn=1e9f, symx=-1e9f, bhmn=1e9f, bhmx=-1e9f;
+    for (int k = 0; k < sn; k++) {
+        if (sxs[k]<sxmn) sxmn=sxs[k];  if (sxs[k]>sxmx) sxmx=sxs[k];
+        if (sys[k]<symn) symn=sys[k];  if (sys[k]>symx) symx=sys[k];
+        if (bhs[k]<bhmn) bhmn=bhs[k];  if (bhs[k]>bhmx) bhmx=bhs[k];
     }
-    return (total >= 3 && on * 10 >= total * 6) ? on : -1;
+    r.sx_spread = sxmx - sxmn;
+    r.sy_spread = symx - symn;
+    r.bh_spread = bhmx - bhmn;
+
+    // STRICT: all entities on-screen, real spread, real perspective
+    if (sn == total &&
+        r.sx_spread >= g_screen_w * 0.30f &&
+        r.sy_spread >= g_screen_h * 0.15f &&
+        r.bh_spread >= 20.0f)
+        r.pass = true;
+    return r;
 }
 
 static bool scan_region_for_vp(uint64_t addr, uint64_t len,
@@ -255,7 +266,7 @@ static bool scan_region_for_vp(uint64_t addr, uint64_t len,
     for (uint64_t off = 0; off < len; off += chunk) {
         uint64_t want = chunk + 64;
         if (off + want > len) want = len - off;
-        if (!rd(addr + off, buf, want)) return false;
+        if (!rd(addr + off, buf, want)) continue;   // v11: skip unreadable, keep going
         for (uint64_t o = 0; o + 64 <= chunk && off + o + 64 <= want; o += 16) {
             const float *m = (const float *)(buf + o);
             if (!(m[15] != 0.0f && (fabsf(m[3]) + fabsf(m[7]) + fabsf(m[11])) > 1e-6f))
@@ -264,7 +275,7 @@ static bool scan_region_for_vp(uint64_t addr, uint64_t len,
             for (int i = 0; i < 16; i++)
                 if (!(fabsf(m[i]) < 1e9f)) { finite = false; break; }
             if (!finite) continue;
-            if (vp_score(m, es, n) > 0) {
+            if (vp_score(m, es, n).pass) {
                 memcpy(g_vp, m, sizeof(g_vp));
                 return true;
             }
@@ -275,7 +286,7 @@ static bool scan_region_for_vp(uint64_t addr, uint64_t len,
 
 static bool scan_matrix(const Snap *es, int n) {
     mach_vm_address_t addr = 1;
-    uint64_t budget = 96ull * 1024 * 1024;
+    uint64_t budget = 256ull * 1024 * 1024;   // v11: bigger per-tick budget
     while (budget > 0) {
         mach_vm_size_t size = 0;
         vm_region_basic_info_data_64_t info;
@@ -355,9 +366,6 @@ static void worker_loop(void) {
         EspFrame f;
         memset(&f, 0, sizeof f);
 
-        float sxs[MAX_ENTS];
-        int sxs_n = 0;
-
         for (int32_t i = 0; i < size && count < MAX_ENTS; i++) {
             uint64_t e = rd64(arr + 0x20 + 8ull * (uint64_t)i);
             if (!e || !is_hero_obj(e)) continue;
@@ -396,9 +404,7 @@ static void worker_loop(void) {
                 en->box_h = bh;
                 en->box_w = bh * 0.55f;
                 drawn++;
-                if (sxs_n < MAX_ENTS) sxs[sxs_n++] = en->sx;
             }
-
             count++;
         }
         prev_n = count;
@@ -411,29 +417,25 @@ static void worker_loop(void) {
             mlog("auto-flip B->A (B frozen)");
         }
 
-        if (!g_mat_ok && snap_n >= 3) g_mat_ok = scan_matrix(snaps, snap_n);
-
-        // v9b: runtime degenerate check — valid boxes whose sx barely spread
-        // while world positions differ = degenerate matrix -> rescan
-        if (g_mat_ok && sxs_n >= 3) {
-            float mn = 1e9f, mx = -1e9f;
-            for (int k = 0; k < sxs_n; k++) {
-                if (sxs[k] < mn) mn = sxs[k];
-                if (sxs[k] > mx) mx = sxs[k];
-            }
-            if (mx - mn < g_screen_w * 0.10f) {
+        // v11: per-tick revalidation — the camera follows the hero, so a
+        // cached matrix must keep passing STRICT checks every tick.
+        if (g_mat_ok && snap_n >= 3) {
+            VScore cur = vp_score(g_vp, snaps, snap_n);
+            if (!cur.pass) {
+                mlog("matrix stale (on=%d sx=%.0f sy=%.0f bh=%.0f) — rescanning",
+                     cur.onscreen, cur.sx_spread, cur.sy_spread, cur.bh_spread);
                 g_mat_ok = false;
-                mlog("matrix degenerate: sx spread %.1f px, rescanning", mx - mn);
             }
         }
-
-        if (g_mat_ok && drawn == 0 && count > 0) {
-            if (++g_bad_box_ticks >= 10) {
-                g_mat_ok = false;
-                g_bad_box_ticks = 0;
-                mlog("matrix rejected: 0 valid boxes x10 ticks, rescanning");
+        if (!g_mat_ok && snap_n >= 3) {
+            if (scan_matrix(snaps, snap_n)) {
+                g_mat_ok = true;
+                g_rescans++;
+                VScore v = vp_score(g_vp, snaps, snap_n);
+                mlog("matrix FOUND (#%d): on=%d/%d sx=%.0f sy=%.0f bh=%.0f",
+                     g_rescans, v.onscreen, snap_n, v.sx_spread, v.sy_spread, v.bh_spread);
             }
-        } else g_bad_box_ticks = 0;
+        }
 
         f.matrix_ok = g_mat_ok ? 1 : 0;
         f.pos_sel   = (uint32_t)g_pos_sel;
@@ -441,10 +443,10 @@ static void worker_loop(void) {
 
         if (count > 0) {
             snprintf(f.status, sizeof f.status,
-                     "ents=%d dr=%d pos=%c | e0 w=%.1f,%.1f,%.1f sx=%.0f sy=%.0f bh=%.0f hp=%d",
-                     count, drawn, g_pos_sel ? 'B' : 'A',
+                     "ents=%d dr=%d mat=%s pos=%c | e0 w=%.1f,%.1f,%.1f sx=%.0f sy=%.0f bh=%.0f",
+                     count, drawn, g_mat_ok ? "ok" : "scan", g_pos_sel ? 'B' : 'A',
                      f.ents[0].wx, f.ents[0].wy, f.ents[0].wz,
-                     f.ents[0].sx, f.ents[0].sy, f.ents[0].box_h, f.ents[0].hp);
+                     f.ents[0].sx, f.ents[0].sy, f.ents[0].box_h);
         } else {
             snprintf(f.status, sizeof f.status, "ents=0 pos=%c",
                      g_pos_sel ? 'B' : 'A');
@@ -740,7 +742,7 @@ static void try_create(void) {
     objc_setAssociatedObject(v, "dl", dl, OBJC_ASSOCIATION_RETAIN);
 
     g_initialized = true;
-    mlog("overlay up (v9b)");
+    mlog("overlay up (v11)");
 }
 
 static void create_loop(void) {
@@ -756,7 +758,7 @@ static void create_loop(void) {
 
 __attribute__((constructor))
 static void mlb_inject_ctor(void) {
-    mlog("=== ctor fired: VERSION 9B BUILD ===");
+    mlog("=== ctor fired: VERSION 11 BUILD ===");
     create_loop();
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         sleep(3);
