@@ -8,7 +8,7 @@
 //   Hp 0x1AC / HpMax 0x1B0  <- get_m_HpPer
 //   CanSight 0x254          <- get_m_CanSight
 //   Pos A 0x1D0 / Pos B 0x298 <- get_Position tail paths
-//   List candidate 0x198    <- GetAllEntities (auto-probed)
+//   List: auto-probe (locks BM+0x78 m_ShowPlayers)
 
 #import <UIKit/UIKit.h>
 #import <Metal/Metal.h>
@@ -146,12 +146,12 @@ static bool is_hero_obj(uint64_t obj) {
 }
 
 static bool list_valid(uint64_t lst) {
-    uint64_t arr  = rd64(lst + 0x10);
-    int32_t  size = rdi32(lst + 0x18);
+    uint64_t arr  = rd64(lst + 0x10);          // List<T>._items
+    int32_t  size = rdi32(lst + 0x18);         // List<T>._size
     if (!arr || size < 1 || size > 512) return false;
-    if (rdi32(arr + 0x18) != size) return false;
+    if (rdi32(arr + 0x18) != size) return false;  // array length must match
     for (int i = 0; i < size && i < 8; i++) {
-        uint64_t e = rd64(arr + 0x20 + 8ull * i);
+        uint64_t e = rd64(arr + 0x20 + 8ull * i);  // array data at 0x20
         if (!e) continue;
         uint64_t k = rd64(e);
         if (!k) continue;
@@ -183,7 +183,7 @@ static bool project(float x, float y, float z, float *sx, float *sy, float *cw) 
     *cw = w;
     if (w <= 0.001f) return false;   // behind camera
     *sx = (cx / w * 0.5f + 0.5f) * GAME_W;
-    *sy = (1.0f - (cy / w * 0.5f + 0.5f)) * GAME_H;
+    *sy = (1.0f - (cy / w * 0.5f + 0.5f)) * GAME_H;   // Y flip Unity -> view
     return true;
 }
 
@@ -337,6 +337,7 @@ static void worker_loop(void) {
             if (!rd_vec3(e + OFF_ENT_POS_A, pa)) continue;
             if (!rd_vec3(e + OFF_ENT_POS_B, pb)) continue;
 
+            // movement tracking — ALWAYS, before everything
             if (count < prev_n) {
                 move_a += fabsf(pa[0]-prev_a[count][0]) + fabsf(pa[2]-prev_a[count][2]);
                 move_b += fabsf(pb[0]-prev_b[count][0]) + fabsf(pb[2]-prev_b[count][2]);
@@ -344,6 +345,7 @@ static void worker_loop(void) {
             memcpy(prev_a[count], pa, 12);
             memcpy(prev_b[count], pb, 12);
 
+            // fill matrix-scan snapshot BEFORE any projection logic
             if (snap_n < MAX_ENTS) {
                 snaps[snap_n].x = (g_pos_sel == 0) ? pa[0] : pb[0];
                 snaps[snap_n].y = (g_pos_sel == 0) ? pa[1] : pb[1];
@@ -351,6 +353,7 @@ static void worker_loop(void) {
                 snap_n++;
             }
 
+            // reserve the slot — entity is COUNTED no matter what
             EspEnt *en = &f.ents[count];
             en->hp      = rdi32(e + OFF_ENT_HP);
             en->hpmax   = rdi32(e + OFF_ENT_HPMAX);
@@ -369,11 +372,14 @@ static void worker_loop(void) {
                 en->box_w = bh * 0.55f;
                 drawn++;
             }
+            // bh==0 -> sx/sy may still hold valid feet coords; renderer draws
+            // a magenta debug dot for those so projection state is always visible.
 
             count++;
         }
         prev_n = count;
 
+        // bidirectional auto-flip on frozen position set
         if (move_a < 0.01f && move_b > 0.5f && g_pos_sel == 0) {
             g_pos_sel = 1;
             mlog("auto-flip A->B (A frozen)");
@@ -412,7 +418,7 @@ static void worker_loop(void) {
         g_frame = f;
         os_unfair_lock_unlock(&g_lock);
 
-        usleep(100000);
+        usleep(100000);   // 10 Hz
     }
 }
 
@@ -537,7 +543,7 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
                 if (g_cfg.snaplines)
                     dl->AddLine(ImVec2(GAME_W * 0.5f, GAME_H), ImVec2(e.sx, y1), col_line, 1.2f);
             } else if (e.sx != 0 || e.sy != 0) {
-                // box projection failed but feet projected: debug dot
+                // box projection failed but feet projected: magenta debug dot
                 dl->AddCircleFilled(ImVec2(e.sx, e.sy), 3.0f, IM_COL32(255, 0, 255, 255));
             }
         }
@@ -606,6 +612,7 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
 @interface ESPWindow : UIWindow
 @end
 @implementation ESPWindow
+// never become key — the game's window keeps the responder chain
 - (BOOL)canBecomeKeyWindow { return NO; }
 
 - (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)e {
@@ -614,7 +621,7 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
     CGPoint local = [v convertPoint:p fromView:self];
     if (g_menu_open) return v;
     if (CGRectContainsPoint(g_btn_rect_v, local)) return v;
-    return nil;
+    return nil;   // pass everything else through to the game
 }
 @end
 
@@ -656,6 +663,7 @@ static void try_create(void) {
     redSquare.backgroundColor = [UIColor redColor];
     redSquare.userInteractionEnabled = NO;
 
+    // unrotated, full-screen: the scene is ALREADY landscape — 1:1 mapping
     ESPMetalView *v = [[ESPMetalView alloc] initWithFrame:scene.screen.bounds];
     [v configure:g_dev];
 
@@ -695,7 +703,7 @@ static void create_loop(void) {
 
 __attribute__((constructor))
 static void mlb_inject_ctor(void) {
-    mlog("=== ctor fired, dylib loaded ===");
+    mlog("=== ctor fired: VERSION 7 BUILD ===");
     create_loop();
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         sleep(3);
