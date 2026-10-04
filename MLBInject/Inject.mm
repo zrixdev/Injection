@@ -1,8 +1,8 @@
 // MLBInject — internal ESP for MLBB (arm64, injected via ElleKit/TrollFools)
-// v12a: METADATA-RESOLVED W2S — no RVAs, no matrix scanning. Resolves
-// UnityEngine.Camera + get_main + WorldToScreenPoint_Injected via the
-// il2cpp exported API (dlsym), calls the game's own projection on the main
-// thread every frame — always the LIVE camera. Zero-RVA = update-proof.
+// v12b: W2S VARIANT LOOP — your build's Camera has WorldToScreenPoint but the
+// _Injected name/argc combo didn't match; we now try every known variant and
+// log which one matched. Rest identical to v12a (metadata bridge, zero RVA,
+// main-thread W2S, live camera).
 //
 // Data offsets (verified via iGODGame disassembly):
 //   BM class slot 0x7BFBF70 / statics 0xA8 / Instance 0x0  <- get_battleManager
@@ -279,18 +279,11 @@ static void worker_loop(void) {
 }
 
 // ---------------- il2cpp metadata bridge (zero RVA) ----------------
-// Real exported signatures:
-//   Il2CppDomain*          il2cpp_domain_get(void)
-//   void**                 il2cpp_domain_get_assemblies(domain, size_t* size)
-//   Il2CppImage            il2cpp_assembly_get_image(assembly)
-//   Il2CppClass            il2cpp_class_from_name(image, ns, name)
-//   const MethodInfo*      il2cpp_class_get_method_from_name(klass, name, argc)
-// MethodInfo struct: first field = methodPointer (the native fn).
 typedef void*       Il2CppDomain;
 typedef void*       Il2CppAssembly;
 typedef void*       Il2CppImage;
 typedef void*       Il2CppClass;
-typedef void        MethodInfo;      // opaque; we hold MethodInfo* (ptr to struct)
+typedef void        MethodInfo;      // opaque; hold MethodInfo* (ptr to struct)
 
 typedef Il2CppDomain (*fn_domain_get)(void);
 typedef void**       (*fn_domain_get_assemblies)(Il2CppDomain, size_t*);
@@ -305,8 +298,9 @@ static fn_class_from_name       p_class_from_name;
 static fn_class_get_method      p_class_get_method_from_name;
 
 static bool        g_il2cpp_ok = false;
-static MethodInfo *g_mi_main = nullptr;   // &MethodInfo of Camera.get_main
-static MethodInfo *g_mi_w2s  = nullptr;   // &MethodInfo of W2S_Injected
+static MethodInfo *g_mi_main = nullptr;
+static MethodInfo *g_mi_w2s  = nullptr;
+static bool        g_w2s_injected_variant = false;   // affects call shape
 static void*       g_cam = nullptr;
 static int         g_cam_refresh = 0;
 
@@ -344,24 +338,42 @@ static bool il2cpp_bridge_init(void) {
     mlog("il2cpp: Camera class @ %p", camKlass);
 
     MethodInfo *miMain = p_class_get_method_from_name(camKlass, "get_main", 0);
-    MethodInfo *miW2S  = p_class_get_method_from_name(camKlass, "WorldToScreenPoint_Injected", 2);
-    if (!miMain || !miW2S) {
-        mlog("il2cpp: methods missing (main=%p w2s=%p)", (void*)miMain, (void*)miW2S);
+    if (!miMain) miMain = p_class_get_method_from_name(camKlass, "get_main", -1);
+
+    MethodInfo *miW2S = nullptr;
+    static const char *w2s_names[] = {
+        "WorldToScreenPoint_Injected", "WorldToScreenPoint",
+        "WorldToScreenPoint_1", "WorldToScreenPoint_2"
+    };
+    for (size_t i = 0; i < sizeof(w2s_names)/sizeof(w2s_names[0]) && !miW2S; i++) {
+        miW2S = p_class_get_method_from_name(camKlass, w2s_names[i], -1);
+        if (miW2S) {
+            mlog("il2cpp: W2S variant matched: %s", w2s_names[i]);
+            g_w2s_injected_variant = (i == 0);
+        }
+    }
+    if (!miW2S) {
+        mlog("il2cpp: no WorldToScreenPoint variant found on Camera");
         return false;
     }
-    g_mi_main = miMain;   // keep the MethodInfo* — passed as trailing arg on call
+    if (!miMain) {
+        mlog("il2cpp: get_main missing too");
+        return false;
+    }
+    g_mi_main = miMain;
     g_mi_w2s  = miW2S;
-    mlog("il2cpp: methods resolved — main=%p w2s=%p", (void*)g_mi_main, (void*)g_mi_w2s);
+    mlog("il2cpp: methods resolved — main=%p w2s=%p",
+         (void*)g_mi_main, (void*)g_mi_w2s);
     return true;
 }
 
-// MethodInfo struct's first field is the native fn pointer — read it.
+// MethodInfo struct's first field = native fn pointer
 static void *mi_fn(MethodInfo *mi) {
     if (!mi) return nullptr;
     return *(void **)mi;
 }
 
-// ---- main-thread calls (il2cpp convention: last arg = MethodInfo*) ----
+// ---- main-thread calls ----
 static void* cam_get_main(void) {
     void *fn = mi_fn(g_mi_main);
     if (!fn) return nullptr;
@@ -371,7 +383,18 @@ static void* cam_get_main(void) {
 static bool cam_w2s(void *cam, V3 pos, V3 *out) {
     void *fn = mi_fn(g_mi_w2s);
     if (!fn || !cam) return false;
-    ((void (*)(void *, V3 *, V3 *, MethodInfo *))fn)(cam, &pos, out, g_mi_w2s);
+    if (g_w2s_injected_variant) {
+        // (self, in Vector3, ref Vector3 ret, MethodInfo*)
+        ((void (*)(void *, V3 *, V3 *, MethodInfo *))fn)(cam, &pos, out, g_mi_w2s);
+    } else {
+        // plain WorldToScreenPoint returns a boxed Vector3
+        // il2cpp object: [0]=klass, [8]=monitor, [0x10]=float x, [0x14]=y, [0x18]=z
+        void *boxed = ((void *(*)(void *, MethodInfo *))fn)(cam, g_mi_w2s);
+        if (!boxed) return false;
+        rd((uint64_t)boxed + 0x10, out, 12);
+        // free the box via il2cpp GC if available — leak is tiny (one per
+        // entity per frame), and freeing foreign GC objects is riskier
+    }
     if (!(out->x > -1e7f && out->x < 1e7f && out->y > -1e7f && out->y < 1e7f))
         return false;
     return true;
@@ -726,7 +749,7 @@ static void try_create(void) {
     objc_setAssociatedObject(v, "dl", dl, OBJC_ASSOCIATION_RETAIN);
 
     g_initialized = true;
-    mlog("overlay up (v12a w2s-metadata)");
+    mlog("overlay up (v12b w2s-metadata)");
 }
 
 static void create_loop(void) {
@@ -742,7 +765,7 @@ static void create_loop(void) {
 
 __attribute__((constructor))
 static void mlb_inject_ctor(void) {
-    mlog("=== ctor fired: VERSION 12A BUILD (w2s-metadata) ===");
+    mlog("=== ctor fired: VERSION 12B BUILD (w2s-metadata) ===");
     create_loop();
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         sleep(3);
