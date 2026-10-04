@@ -1,9 +1,10 @@
 // MLBInject — internal ESP for MLBB (arm64, injected via ElleKit/TrollFools)
-// v9: ORIENTATION FIX — overlay view is created only once the scene is
-// landscape, and re-syncs to scene.screen.bounds every ~0.5s so a portrait
-// moment at cold-start can never poison the view. All v8 features carried:
-// live screen dims, corrected Y mapping, dead=hp-only, snaps-before-projection,
-// e0 debug status, matrix revalidation, auto-rescan, orange/green style.
+// v9: ORIENTATION FIX — overlay created only when scene is landscape, view
+// re-syncs to scene screen bounds every ~0.5s (cold-start portrait can never
+// poison the view). SDK lacks UIWindow.scene — resync uses our find_scene().
+// Carried from v7/v8: dead=hp-only, snaps-before-projection, e0 debug status,
+// matrix validated with same feet+head math as runtime, auto-rescan,
+// live screen dims, orange boxes / green HP / orange snaplines.
 //
 // Offset provenance (verified via iGODGame disassembly):
 //   BM class slot 0x7BFBF70 / statics 0xA8 / Instance 0x0  <- get_battleManager
@@ -75,9 +76,12 @@ static void mlog(const char *fmt, ...) {
 #define HERO_H               2.2f     // world-units hero height; tune 2.0-4.0
 #define MAX_ENTS             64
 
-// live screen dims (points) — synced from scene every ~0.5s
+// live screen dims (points) — synced from scene at creation + every ~0.5s
 static float g_screen_w = 667.0f;
 static float g_screen_h = 375.0f;
+
+// forward decl (SDK lacks UIWindow.scene; we use our own lookup everywhere)
+static UIWindowScene *find_scene(void);
 
 // ---------------- shared frame ----------------
 typedef struct {
@@ -207,6 +211,7 @@ static float project_box(float x, float y, float z,
 // ---------------- camera matrix scan ----------------
 typedef struct Snap { float x, y, z; } Snap;
 
+// validate with the SAME feet+head box projection used at runtime
 static int vp_score(const float m[16], const Snap *es, int n) {
     float save[16];
     memcpy(save, g_vp, sizeof(save));
@@ -342,6 +347,7 @@ static void worker_loop(void) {
             if (!rd_vec3(e + OFF_ENT_POS_A, pa)) continue;
             if (!rd_vec3(e + OFF_ENT_POS_B, pb)) continue;
 
+            // movement tracking — ALWAYS, before everything
             if (count < prev_n) {
                 move_a += fabsf(pa[0]-prev_a[count][0]) + fabsf(pa[2]-prev_a[count][2]);
                 move_b += fabsf(pb[0]-prev_b[count][0]) + fabsf(pb[2]-prev_b[count][2]);
@@ -349,6 +355,7 @@ static void worker_loop(void) {
             memcpy(prev_a[count], pa, 12);
             memcpy(prev_b[count], pb, 12);
 
+            // fill matrix-scan snapshot BEFORE any projection logic
             if (snap_n < MAX_ENTS) {
                 snaps[snap_n].x = (g_pos_sel == 0) ? pa[0] : pb[0];
                 snaps[snap_n].y = (g_pos_sel == 0) ? pa[1] : pb[1];
@@ -356,11 +363,12 @@ static void worker_loop(void) {
                 snap_n++;
             }
 
+            // reserve the slot — entity is COUNTED no matter what
             EspEnt *en = &f.ents[count];
             en->hp      = rdi32(e + OFF_ENT_HP);
             en->hpmax   = rdi32(e + OFF_ENT_HPMAX);
             en->visible = rdi32(e + OFF_ENT_CANSIGHT);
-            en->dead    = (en->hp <= 0);
+            en->dead    = (en->hp <= 0);   // 0xD0 unverified — hp-only
             en->sx = 0; en->sy = 0; en->box_h = 0; en->box_w = 0;
 
             float fx = (g_pos_sel == 0) ? pa[0] : pb[0];
@@ -374,11 +382,14 @@ static void worker_loop(void) {
                 en->box_w = bh * 0.55f;
                 drawn++;
             }
+            // bh==0 -> feet coords may still be valid; renderer draws a
+            // magenta debug dot so projection state is always visible.
 
             count++;
         }
         prev_n = count;
 
+        // bidirectional auto-flip on frozen position set
         if (move_a < 0.01f && move_b > 0.5f && g_pos_sel == 0) {
             g_pos_sel = 1;
             mlog("auto-flip A->B (A frozen)");
@@ -389,6 +400,7 @@ static void worker_loop(void) {
 
         if (!g_mat_ok && snap_n >= 3) g_mat_ok = scan_matrix(snaps, snap_n);
 
+        // rescan if matrix "ok" but nothing valid for ~1s (wrong/stale matrix)
         if (g_mat_ok && drawn == 0 && count > 0) {
             if (++g_bad_box_ticks >= 10) {
                 g_mat_ok = false;
@@ -401,6 +413,7 @@ static void worker_loop(void) {
         f.pos_sel   = (uint32_t)g_pos_sel;
         f.entity_count = count;
 
+        // debug: entity 0 raw numbers on the status line
         if (count > 0) {
             snprintf(f.status, sizeof f.status,
                      "ents=%d dr=%d pos=%c | e0 sx=%.0f sy=%.0f bh=%.0f hp=%d",
@@ -415,7 +428,7 @@ static void worker_loop(void) {
         g_frame = f;
         os_unfair_lock_unlock(&g_lock);
 
-        usleep(100000);
+        usleep(100000);   // 10 Hz
     }
 }
 
@@ -476,18 +489,22 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
 - (void)drawFrame {
     if (!g_initialized) return;
 
-    // v9: orientation re-sync — if the scene's screen dims changed (cold-start
-    // portrait -> game landscape, or any drift), resize to match. ~2x/sec.
+    // v9: orientation re-sync — resize to scene screen bounds if they drift
+    // (cold-start portrait -> game landscape). ~2x/sec. Uses find_scene()
+    // because this SDK's headers lack UIWindow.scene.
     static int _sync = 0;
-    if ((++_sync % 15) == 0 && self.window.scene) {
-        CGRect sb = self.window.scene.screen.bounds;
-        if (fabsf(sb.size.width  - self.bounds.size.width)  > 0.5f ||
-            fabsf(sb.size.height - self.bounds.size.height) > 0.5f) {
-            self.frame = CGRectMake(0, 0, sb.size.width, sb.size.height);
-            g_screen_w = (float)sb.size.width;
-            g_screen_h = (float)sb.size.height;
-            [self syncSize];
-            mlog("resync view -> %.0fx%.0f", sb.size.width, sb.size.height);
+    if ((++_sync % 15) == 0) {
+        UIWindowScene *scn = find_scene();
+        if (scn) {
+            CGRect sb = scn.screen.bounds;
+            if (std::abs((double)sb.size.width  - (double)self.bounds.size.width)  > 0.5 ||
+                std::abs((double)sb.size.height - (double)self.bounds.size.height) > 0.5) {
+                self.frame = CGRectMake(0, 0, sb.size.width, sb.size.height);
+                g_screen_w = (float)sb.size.width;
+                g_screen_h = (float)sb.size.height;
+                [self syncSize];
+                mlog("resync view -> %.0fx%.0f", sb.size.width, sb.size.height);
+            }
         }
     }
 
@@ -557,6 +574,7 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
                     dl->AddLine(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y),
                                 ImVec2(e.sx, y1), col_line, 1.2f);
             } else if (e.sx != 0 || e.sy != 0) {
+                // box projection failed but feet projected: magenta debug dot
                 dl->AddCircleFilled(ImVec2(e.sx, e.sy), 3.0f, IM_COL32(255, 0, 255, 255));
             }
         }
@@ -627,6 +645,7 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
 @interface ESPWindow : UIWindow
 @end
 @implementation ESPWindow
+// never become key — the game's window keeps the responder chain
 - (BOOL)canBecomeKeyWindow { return NO; }
 
 - (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)e {
@@ -635,7 +654,7 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
     CGPoint local = [v convertPoint:p fromView:self];
     if (g_menu_open) return v;
     if (CGRectContainsPoint(g_btn_rect_v, local)) return v;
-    return nil;
+    return nil;   // pass everything else through to the game
 }
 @end
 
