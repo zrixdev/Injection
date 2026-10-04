@@ -1,13 +1,12 @@
 // MLBInject — internal ESP for MLBB (arm64, injected via ElleKit/TrollFools)
-// v16: ROW-MAJOR FIX — the transpose bug found by the v15 log (ndc ny stable
-// ~2.6, w stuck at 1 = affine = transposed matrices). Unity stores matrices
-// ROW-MAJOR (m[r*4+c], translation in m[3],m[7],m[11]); mat_vec/mat_mul now
-// use the correct convention. Matrices fetched from the LIVE camera via
-// runtime_invoke (get_worldToCameraMatrix + get_projectionMatrix), both
-// multiply orders auto-tested, winner locked. Local hero = CYAN box;
-// snaplines run local hero -> enemy box CENTERS (friend's spec).
-// Carried: landscape gate + resync, non-key window, dead=hp-only, e0 status,
-// orange boxes / green HP.
+// v17: ROW-MAJOR MATH (v16 fix, now actually deployed) + RELAXED SELECTOR
+// (live camera legitimately culls heroes — old 8/9 threshold could never
+// lock) + REAL LOCAL PLAYER via BattleManager+0x50 (m_LocalPlayerShow, old
+// dump; validated at runtime by ShowPlayer class check; fallback = closest-
+// to-center heuristic). Local hero = CYAN box; snaplines local -> enemy box
+// CENTERS. Matrices fetched from the LIVE camera via runtime_invoke, both
+// multiply orders auto-tested. Carried: landscape gate + resync, non-key
+// window, dead=hp-only, e0 status, orange boxes / green HP.
 //
 // Data offsets (verified via iGODGame disassembly):
 //   BM class slot 0x7BFBF70 / statics 0xA8 / Instance 0x0  <- get_battleManager
@@ -15,6 +14,7 @@
 //   CanSight 0x254          <- get_m_CanSight
 //   Pos A 0x1D0 / Pos B 0x298 <- get_Position tail paths (B verified live)
 //   List: auto-probe (locks BM+0x78 m_ShowPlayers)
+//   Local player: BM+0x50 (m_LocalPlayerShow, old dump — runtime-validated)
 
 #import <UIKit/UIKit.h>
 #import <Metal/Metal.h>
@@ -73,6 +73,7 @@ static void mlog(const char *fmt, ...) {
 #define OFF_ENT_CANSIGHT     0x254
 #define OFF_ENT_POS_A        0x1D0
 #define OFF_ENT_POS_B        0x298
+#define OFF_BM_LOCALSHOW     0x50      // m_LocalPlayerShow (old dump, validated)
 
 #define HERO_H               2.2f
 #define MAX_ENTS             64
@@ -90,8 +91,10 @@ typedef struct {
 
 typedef struct {
     uint32_t entity_count, pos_sel;
-    char status[192];
-    EspEnt ents[MAX_ENTS];
+    int32_t  local_ok;                // BM+0x50 probe succeeded
+    float    lwx, lwy, lwz;           // local hero world pos
+    char     status[192];
+    EspEnt   ents[MAX_ENTS];
 } EspFrame;
 
 static EspFrame       g_frame;
@@ -131,14 +134,19 @@ typedef struct KlassCache { uint64_t obj; bool hero; } KlassCache;
 static KlassCache g_kcache[512];
 static int g_kcache_n = 0;
 
+static bool class_name_is(uint64_t obj, const char *prefix) {
+    uint64_t k = rd64(obj);
+    if (!k) return false;
+    char nm[64];
+    return rd_cstr(rd64(k + OFF_CLASS_NAME), nm, sizeof(nm)) &&
+           strncmp(nm, prefix, strlen(prefix)) == 0;
+}
+
 static bool is_hero_obj(uint64_t obj) {
     if (!obj) return false;
     for (int i = 0; i < g_kcache_n; i++)
         if (g_kcache[i].obj == obj) return g_kcache[i].hero;
-    uint64_t k = rd64(obj);
-    char nm[64];
-    bool hero = k && rd_cstr(rd64(k + OFF_CLASS_NAME), nm, sizeof(nm)) &&
-                strncmp(nm, "ShowPlayer", 10) == 0;
+    bool hero = class_name_is(obj, "ShowPlayer");
     if (g_kcache_n < 512) {
         g_kcache[g_kcache_n].obj = obj;
         g_kcache[g_kcache_n].hero = hero;
@@ -181,6 +189,9 @@ static int discover_list(uint64_t bm) {
 static void worker_loop(void) {
     static float prev_a[MAX_ENTS][3], prev_b[MAX_ENTS][3];
     static int prev_n = 0;
+    static uint64_t probe_bm = 0;
+    static bool probe_logged = false;
+    static bool probe_failed_logged = false;
 
     for (;;) {
         if (!g_uf) {
@@ -223,6 +234,7 @@ static void worker_loop(void) {
                 usleep(500000); continue;
             }
         }
+        if (probe_bm != bm) { probe_bm = bm; probe_logged = false; probe_failed_logged = false; }
 
         uint64_t lst = rd64(bm + g_list_off);
         uint64_t arr = lst ? rd64(lst + 0x10) : 0;
@@ -262,6 +274,30 @@ static void worker_loop(void) {
         }
         prev_n = count;
 
+        // ---- local player probe: BM+0x50 = m_LocalPlayerShow ----
+        // validated: must be a ShowPlayer-class object with readable positions
+        f.local_ok = 0;
+        uint64_t lshow = rd64(bm + OFF_BM_LOCALSHOW);
+        if (lshow && is_hero_obj(lshow)) {
+            float la[3] = {0}, lb[3] = {0};
+            if (rd_vec3(lshow + OFF_ENT_POS_A, la) && rd_vec3(lshow + OFF_ENT_POS_B, lb)) {
+                f.lwx = (g_pos_sel == 0) ? la[0] : lb[0];
+                f.lwy = (g_pos_sel == 0) ? la[1] : lb[1];
+                f.lwz = (g_pos_sel == 0) ? la[2] : lb[2];
+                f.local_ok = 1;
+                if (!probe_logged) {
+                    probe_logged = true;
+                    mlog("local player via BM+0x50: ShowPlayer @ 0x%llx",
+                         (unsigned long long)lshow);
+                }
+            }
+        }
+        if (!f.local_ok && !probe_failed_logged && count > 0) {
+            probe_failed_logged = true;
+            mlog("BM+0x50 probe failed (ptr=%llx) — fallback to center heuristic",
+                 (unsigned long long)lshow);
+        }
+
         if (move_a < 0.01f && move_b > 0.5f && g_pos_sel == 0) {
             g_pos_sel = 1;
             mlog("auto-flip A->B (A frozen)");
@@ -272,7 +308,8 @@ static void worker_loop(void) {
 
         f.pos_sel = (uint32_t)g_pos_sel;
         f.entity_count = count;
-        snprintf(f.status, sizeof f.status, "ents=%d pos=%c", count, g_pos_sel ? 'B' : 'A');
+        snprintf(f.status, sizeof f.status, "ents=%d pos=%c loc=%s",
+                 count, g_pos_sel ? 'B' : 'A', f.local_ok ? "ptr" : "heu");
 
         os_unfair_lock_lock(&g_lock);
         g_frame = f;
@@ -304,11 +341,11 @@ static fn_class_get_method      p_class_get_method_from_name;
 static fn_runtime_invoke        p_runtime_invoke;
 
 static bool        g_il2cpp_ok = false;
-static MethodInfo *g_mi_main  = nullptr;   // Camera.get_main
-static MethodInfo *g_mi_w2cm  = nullptr;   // Camera.get_worldToCameraMatrix
-static MethodInfo *g_mi_proj  = nullptr;   // Camera.get_projectionMatrix
-static MethodInfo *g_mi_scr_w = nullptr;   // Screen.get_width
-static MethodInfo *g_mi_scr_h = nullptr;   // Screen.get_height
+static MethodInfo *g_mi_main  = nullptr;
+static MethodInfo *g_mi_w2cm  = nullptr;
+static MethodInfo *g_mi_proj  = nullptr;
+static MethodInfo *g_mi_scr_w = nullptr;
+static MethodInfo *g_mi_scr_h = nullptr;
 static void*       g_cam = nullptr;
 static void*       g_last_cam = nullptr;
 static int         g_cam_stable = 0;
@@ -377,7 +414,7 @@ static void* cam_get_main(void) {
     return ((void *(*)(MethodInfo *))fn)(g_mi_main);
 }
 
-// runtime_invoke returns boxed value types — Matrix4x4 box = [hdr 0x10][64B]
+// runtime_invoke boxes value-type returns — Matrix4x4 box = [hdr 0x10][64B]
 static bool invoke_mat4(MethodInfo *mi, void *self, float out[16]) {
     void *fn = mi_fn(mi);
     if (!fn || !p_runtime_invoke) return false;
@@ -399,12 +436,11 @@ static int32_t screen_get_h(void) {
 }
 
 // ---------------- matrix math (Unity ROW-major storage) ----------------
-// m[r*4+c]; clip = M * (v, w) — column-vector convention, correct multiply
+// m[r*4+c]; clip = M * (v, w) — column-vector convention
 static void mat_vec(const float m[16], const V3 &v, float w, float out[4]) {
     for (int r = 0; r < 4; r++)
         out[r] = m[r*4+0]*v.x + m[r*4+1]*v.y + m[r*4+2]*v.z + m[r*4+3]*w;
 }
-// out = A * B (row-major, column-vector convention)
 static void mat_mul(float out[16], const float a[16], const float b[16]) {
     for (int r = 0; r < 4; r++)
         for (int c = 0; c < 4; c++) {
@@ -563,23 +599,24 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
         mats_ok = invoke_mat4(g_mi_w2cm, g_cam, V) && invoke_mat4(g_mi_proj, g_cam, P);
     }
 
-    // ---- build VP for both multiply orders, auto-pick by on-screen count ----
-    static int conv = -1;             // 0 = VP=P*V (standard), 1 = VP=V*P
-    static int conv_good_ticks[2] = {0,0};
-    static int conv_dbg_tick = 0;
-
     float VP1[16], VP2[16];
     if (mats_ok) {
         mat_mul(VP1, P, V);          // standard: clip = P * V * pos
-        mat_mul(VP2, V, P);          // fallback: covers storage-order surprises
+        mat_mul(VP2, V, P);          // fallback: covers storage surprises
     }
 
     struct Draw { float sx, sy, bh, bw; int hp, hpmax; bool ok; };
     static Draw draws[MAX_ENTS];
     int nd = 0, valid = 0;
 
+    // ---- convention auto-pick: RELAXED (live camera culls heroes outside
+    // view — old 8/9 threshold could never lock). Needs a CLEAR WINNER:
+    // >=4 on-screen AND beats the other convention by >=2, 2 ticks. ----
+    static int conv = -1;
+    static int conv_good_ticks[2] = {0,0};
+    static int conv_dbg_tick = 0;
+
     if (mats_ok) {
-        // score both conventions
         int on[2] = {0,0};
         V3 dbg[2] = {{0,0,0},{0,0,0}};
         float dbgW[2] = {0,0};
@@ -599,23 +636,25 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
             }
         }
         if (conv < 0) {
+            int win = -1;
             for (int cv = 0; cv < 2; cv++) {
-                if (on[cv] >= (int)f.entity_count - 1) conv_good_ticks[cv]++;
+                int other = 1 - cv;
+                bool strong = (on[cv] >= 4) && (on[cv] >= on[other] + 2);
+                if (strong) conv_good_ticks[cv]++;
                 else conv_good_ticks[cv] = 0;
+                if (conv_good_ticks[cv] >= 2) win = cv;
             }
             if (++conv_dbg_tick % 30 == 1)
                 mlog("mats: on(P*V)=%d on(V*P)=%d ndc e0 = %.3f,%.3f,%.3f w=%.3f",
                      on[0], on[1], dbg[0].x, dbg[0].y, dbg[0].z, dbgW[0]);
-            for (int cv = 0; cv < 2; cv++) {
-                if (conv_good_ticks[cv] >= 2 && on[cv] >= 6) {
-                    conv = cv;
-                    mlog("CONVENTION SELECTED: %s (on=%d)", cv ? "V*P" : "P*V", on[cv]);
-                    break;
-                }
+            if (win >= 0) {
+                conv = win;
+                mlog("CONVENTION SELECTED: %s (on=%d vs %d)",
+                     win ? "V*P" : "P*V", on[win], on[1 - win]);
             }
         }
 
-        // project with locked convention
+        // project entities with locked convention
         if (conv >= 0) {
             const float *vp = (conv == 0) ? VP1 : VP2;
             for (uint32_t i = 0; i < f.entity_count && i < MAX_ENTS; i++) {
@@ -648,12 +687,27 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
         }
     }
 
-    // ---- local hero: closest to screen center across 5+ ticks, sane hp ----
-    static float local_sx = 0, local_sy = 0;
+    // ---- local hero: PRIMARY = BM+0x50 pointer (projected here);
+    // FALLBACK = closest-to-center heuristic ----
+    static float local_sx = 0, local_sy = 0, local_bh = 0;
     static bool  local_valid = false;
-    static int   local_idx = -1;
     static int   local_streak = 0;
-    {
+    local_valid = false;
+    if (conv >= 0 && f.local_ok) {
+        float oF[4], oH[4];
+        const float *vp = (conv == 0) ? VP1 : VP2;
+        mat_vec(vp, {f.lwx, f.lwy, f.lwz}, 1.0f, oF);
+        mat_vec(vp, {f.lwx, f.lwy + HERO_H, f.lwz}, 1.0f, oH);
+        if (oF[3] > 0.001f && oH[3] > 0.001f) {
+            local_sx = (oF[0]/oF[3]*0.5f + 0.5f) * su_w * mx;
+            local_sy = (1.0f - (oF[1]/oF[3]*0.5f + 0.5f)) * su_h * my;
+            float shy = (1.0f - (oH[1]/oH[3]*0.5f + 0.5f)) * su_h * my;
+            local_bh = fabsf(local_sy - shy);
+            local_valid = (local_bh >= 2.0f && local_bh <= 2000.0f);
+        }
+    }
+    if (!local_valid && conv >= 0) {
+        // fallback heuristic (friend's): closest to center, sane hp, 5+ ticks
         int best = -1;
         float bestD = 1e9f;
         float cx = io.DisplaySize.x * 0.5f, cy = io.DisplaySize.y * 0.5f;
@@ -671,52 +725,59 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
             if (local_streak >= 5) {
                 local_sx = draws[best].sx;
                 local_sy = draws[best].sy - draws[best].bh * 0.5f;
-                local_idx = best;
+                local_bh = draws[best].bh;
                 local_valid = true;
             }
         } else {
             local_streak = 0;
-            local_valid = false;
         }
     }
 
     ImDrawList *dl = ImGui::GetBackgroundDrawList();
 
     if (g_cfg.esp_on && conv >= 0) {
+        const ImU32 col_box   = IM_COL32(255, 165, 0, 255);   // orange
+        const ImU32 col_line  = IM_COL32(255, 165, 0, 180);
+        const ImU32 col_hpbg  = IM_COL32(0, 0, 0, 180);
+        const ImU32 col_hp    = IM_COL32(80, 220, 60, 255);
+        const ImU32 col_local = IM_COL32(0, 220, 255, 255);   // cyan = YOU
+
+        // enemy/ally boxes
         for (int i = 0; i < nd; i++) {
             const Draw &dd = draws[i];
-            if (dd.hp <= 0) continue;
+            if (dd.hp <= 0 || !dd.ok) continue;
 
-            bool is_local = (local_valid && i == local_idx);
-            // CYAN for YOUR hero, orange for everyone else
-            const ImU32 col_box  = is_local ? IM_COL32(0, 220, 255, 255)
-                                            : IM_COL32(255, 165, 0, 255);
-            const ImU32 col_line = IM_COL32(255, 165, 0, 180);
-            const ImU32 col_hpbg = IM_COL32(0, 0, 0, 180);
-            const ImU32 col_hp   = IM_COL32(80, 220, 60, 255);
+            float h = dd.bh, w = dd.bw;
+            float x0 = dd.sx - w * 0.5f, y0 = dd.sy - h;
+            float x1 = dd.sx + w * 0.5f, y1 = dd.sy;
 
-            if (dd.ok) {
-                float h = dd.bh, w = dd.bw;
-                float x0 = dd.sx - w * 0.5f, y0 = dd.sy - h;
-                float x1 = dd.sx + w * 0.5f, y1 = dd.sy;
+            if (g_cfg.boxes)
+                dl->AddRect(ImVec2(x0, y0), ImVec2(x1, y1), col_box, 0.0f, 0, 2.0f);
 
-                if (g_cfg.boxes)
-                    dl->AddRect(ImVec2(x0, y0), ImVec2(x1, y1), col_box, 0.0f, 0, 2.0f);
+            if (g_cfg.hp_bars && dd.hpmax > 0) {
+                float pct = (float)dd.hp / (float)dd.hpmax;
+                if (pct < 0) pct = 0; if (pct > 1) pct = 1;
+                float bx = x0 - 7.0f;
+                dl->AddRectFilled(ImVec2(bx - 1, y0 - 1), ImVec2(bx + 4, y1 + 1), col_hpbg);
+                dl->AddRectFilled(ImVec2(bx, y1 - (y1 - y0) * pct), ImVec2(bx + 3, y1), col_hp);
+            }
+        }
 
-                if (g_cfg.hp_bars && dd.hpmax > 0) {
-                    float pct = (float)dd.hp / (float)dd.hpmax;
-                    if (pct < 0) pct = 0; if (pct > 1) pct = 1;
-                    float bx = x0 - 7.0f;
-                    dl->AddRectFilled(ImVec2(bx - 1, y0 - 1), ImVec2(bx + 4, y1 + 1), col_hpbg);
-                    dl->AddRectFilled(ImVec2(bx, y1 - (y1 - y0) * pct), ImVec2(bx + 3, y1), col_hp);
-                }
+        // YOUR hero: cyan box (drawn from the BM+0x50 projection)
+        if (local_valid && local_bh >= 2.0f) {
+            float w = local_bh * 0.55f, h = local_bh;
+            float x0 = local_sx - w * 0.5f, y0 = local_sy - h;
+            float x1 = local_sx + w * 0.5f, y1 = local_sy;
+            dl->AddRect(ImVec2(x0, y0), ImVec2(x1, y1), col_local, 0.0f, 0, 2.0f);
+        }
 
-                // snapline: YOUR hero -> enemy box centers (skip own line)
-                if (g_cfg.snaplines && local_valid && !is_local)
-                    dl->AddLine(ImVec2(local_sx, local_sy),
-                                ImVec2(dd.sx, dd.sy - dd.bh * 0.5f), col_line, 1.2f);
-            } else if (dd.sx != 0 || dd.sy != 0) {
-                dl->AddCircleFilled(ImVec2(dd.sx, dd.sy), 3.0f, IM_COL32(255, 0, 255, 255));
+        // snaplines: YOUR hero -> box centers
+        if (g_cfg.snaplines && local_valid) {
+            for (int i = 0; i < nd; i++) {
+                const Draw &dd = draws[i];
+                if (dd.hp <= 0 || !dd.ok) continue;
+                dl->AddLine(ImVec2(local_sx, local_sy),
+                            ImVec2(dd.sx, dd.sy - dd.bh * 0.5f), col_line, 1.2f);
             }
         }
     }
@@ -742,11 +803,12 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
     if (g_cfg.status_text) {
         char st[224];
         snprintf(st, sizeof st,
-                 "ents=%u dr=%d pos=%c cam=%s conv=%s su=%.0fx%.0f loc=%d | e0 w=%.1f,%.1f,%.1f",
+                 "ents=%u dr=%d pos=%c cam=%s conv=%s su=%.0fx%.0f loc=%s | e0 w=%.1f,%.1f,%.1f",
                  f.entity_count, valid, f.pos_sel ? 'B' : 'A',
                  cam_ok ? "ok" : "wait",
                  conv < 0 ? "cal" : (conv ? "V*P" : "P*V"),
-                 su_w, su_h, local_valid ? 1 : 0,
+                 su_w, su_h,
+                 f.local_ok ? "ptr" : (local_valid ? "heu" : "no"),
                  f.entity_count ? f.ents[0].wx : 0.f,
                  f.entity_count ? f.ents[0].wy : 0.f,
                  f.entity_count ? f.ents[0].wz : 0.f);
@@ -869,7 +931,7 @@ static void try_create(void) {
     objc_setAssociatedObject(v, "dl", dl, OBJC_ASSOCIATION_RETAIN);
 
     g_initialized = true;
-    mlog("overlay up (v16 row-major)");
+    mlog("overlay up (v17 row-major + localplayer)");
 }
 
 static void create_loop(void) {
@@ -885,7 +947,7 @@ static void create_loop(void) {
 
 __attribute__((constructor))
 static void mlb_inject_ctor(void) {
-    mlog("=== ctor fired: VERSION 16 BUILD (row-major) ===");
+    mlog("=== ctor fired: VERSION 17 BUILD (row-major + localplayer) ===");
     create_loop();
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         sleep(3);
