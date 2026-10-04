@@ -203,8 +203,7 @@ static float project_box(float x, float y, float z,
 // ---------------- camera matrix scan ----------------
 typedef struct Snap { float x, y, z; } Snap;
 
-// v7: validate with the SAME feet+head box projection used at runtime.
-// A wrong camera (shadow/minimap) with a broken height axis fails here.
+// validate with the SAME feet+head box projection used at runtime
 static int vp_score(const float m[16], const Snap *es, int n) {
     float save[16];
     memcpy(save, g_vp, sizeof(save));
@@ -356,7 +355,7 @@ static void worker_loop(void) {
             en->hp      = rdi32(e + OFF_ENT_HP);
             en->hpmax   = rdi32(e + OFF_ENT_HPMAX);
             en->visible = rdi32(e + OFF_ENT_CANSIGHT);
-            en->dead    = (en->hp <= 0);   // v7: 0xD0 unverified — hp-only
+            en->dead    = (en->hp <= 0);   // 0xD0 unverified — hp-only
             en->sx = 0; en->sy = 0; en->box_h = 0; en->box_w = 0;
 
             float fx = (g_pos_sel == 0) ? pa[0] : pb[0];
@@ -370,8 +369,6 @@ static void worker_loop(void) {
                 en->box_w = bh * 0.55f;
                 drawn++;
             }
-            // bh == 0 -> sx/sy may still be valid feet coords; renderer draws
-            // a debug dot for those so we always SEE projection state.
 
             count++;
         }
@@ -540,7 +537,7 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
                 if (g_cfg.snaplines)
                     dl->AddLine(ImVec2(GAME_W * 0.5f, GAME_H), ImVec2(e.sx, y1), col_line, 1.2f);
             } else if (e.sx != 0 || e.sy != 0) {
-                // projection of box failed but feet projected: debug dot
+                // box projection failed but feet projected: debug dot
                 dl->AddCircleFilled(ImVec2(e.sx, e.sy), 3.0f, IM_COL32(255, 0, 255, 255));
             }
         }
