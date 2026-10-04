@@ -1,13 +1,11 @@
 // MLBInject — internal ESP for MLBB (arm64, injected via ElleKit/TrollFools)
-// v13: DISASM-GROUNDED W2S.
-//   - W2S resolved by METHOD ENUMERATION (class_get_method_from_name misses
-//     _Injected on this build) — logs every candidate name+argc.
-//   - Injected shape (friend's fix, confirmed by disasm): Vector3 returned
-//     BY VALUE in s0/s1/s2 — call is (cam, &pos, mi) -> V3.
-//   - Plain WorldToScreenPoint is a GC wrapper (disasm) -> runtime_invoke
-//     + object_unbox path if only the plain overload resolves.
-//   - Crash guards: camera refreshed EVERY frame, 3-frame stability gate,
-//     project only when battle list live, W2S auto-disable on garbage.
+// v14: AUTO-CALIBRATING W2S.
+//   - Three call shapes tested SEQUENTIALLY against live entities (A:ref-in
+//     [friend's] -> C:ref-out -> B:val-in); the shape that lands heroes
+//     on-screen wins and is locked in. Wrong shapes never run after a winner.
+//   - UnityEngine.Screen::get_width/height resolved + called — W2S coordinate
+//     space MEASURED (render res != points != drawable all absorbed).
+//   - Camera refreshed every frame, 3-frame stability gate, battle-live gate.
 //   - Friend's snapline: local hero approx (closest-to-center 5+ ticks,
 //     sane hp), lines from local to box CENTERS.
 // Carried: landscape gate + resync, non-key window, dead=hp-only, e0 status,
@@ -298,11 +296,8 @@ typedef void**       (*fn_domain_get_assemblies)(Il2CppDomain, size_t*);
 typedef Il2CppImage  (*fn_assembly_get_image)(Il2CppAssembly);
 typedef Il2CppClass  (*fn_class_from_name)(Il2CppImage, const char*, const char*);
 typedef MethodInfo*  (*fn_class_get_method)(Il2CppClass, const char*, int);
-typedef MethodInfo*  (*fn_class_get_methods)(Il2CppClass, void**);   // enumerator
+typedef MethodInfo*  (*fn_class_get_methods)(Il2CppClass, void**);
 typedef const char*  (*fn_method_get_name)(MethodInfo*);
-typedef int          (*fn_method_get_param_count)(MethodInfo*);
-typedef void*        (*fn_runtime_invoke)(MethodInfo*, void*, void**, void**);
-typedef void*        (*fn_object_unbox)(void*);
 
 static fn_domain_get            p_domain_get;
 static fn_domain_get_assemblies p_domain_get_assemblies;
@@ -311,16 +306,12 @@ static fn_class_from_name       p_class_from_name;
 static fn_class_get_method      p_class_get_method_from_name;
 static fn_class_get_methods     p_class_get_methods;
 static fn_method_get_name       p_method_get_name;
-static fn_method_get_param_count p_method_get_param_count;
-static fn_runtime_invoke        p_runtime_invoke;
-static fn_object_unbox          p_object_unbox;
 
-static bool        g_il2cpp_ok   = false;
-static MethodInfo *g_mi_main     = nullptr;
-static MethodInfo *g_mi_w2s      = nullptr;   // preferred: Injected (argc==2)
-static MethodInfo *g_mi_w2s_alt  = nullptr;   // fallback: plain (argc==1)
-static bool        g_w2s_injected = false;    // true -> direct by-value shape
-static bool        g_w2s_banned  = false;     // auto-disabled on garbage
+static bool        g_il2cpp_ok = false;
+static MethodInfo *g_mi_main = nullptr;
+static MethodInfo *g_mi_w2s   = nullptr;
+static MethodInfo *g_mi_scr_w = nullptr;   // Screen.get_width
+static MethodInfo *g_mi_scr_h = nullptr;   // Screen.get_height
 static void*       g_cam = nullptr;
 static void*       g_last_cam = nullptr;
 static int         g_cam_stable = 0;
@@ -335,16 +326,11 @@ static bool il2cpp_bridge_init(void) {
     p_class_get_method_from_name = (fn_class_get_method)dlsym(RTLD_DEFAULT, "il2cpp_class_get_method_from_name");
     p_class_get_methods          = (fn_class_get_methods)dlsym(RTLD_DEFAULT, "il2cpp_class_get_methods");
     p_method_get_name            = (fn_method_get_name)dlsym(RTLD_DEFAULT, "il2cpp_method_get_name");
-    p_method_get_param_count     = (fn_method_get_param_count)dlsym(RTLD_DEFAULT, "il2cpp_method_get_param_count");
-    p_runtime_invoke             = (fn_runtime_invoke)dlsym(RTLD_DEFAULT, "il2cpp_runtime_invoke");
-    p_object_unbox               = (fn_object_unbox)dlsym(RTLD_DEFAULT, "il2cpp_object_unbox");
 
     if (!p_domain_get || !p_domain_get_assemblies || !p_assembly_get_image ||
         !p_class_from_name || !p_class_get_method_from_name ||
-        !p_class_get_methods || !p_method_get_name || !p_method_get_param_count) {
-        mlog("il2cpp API: dlsym incomplete (core=%d enum=%d)",
-             !!(p_domain_get && p_class_from_name && p_class_get_method_from_name),
-             !!(p_class_get_methods && p_method_get_name && p_method_get_param_count));
+        !p_class_get_methods || !p_method_get_name) {
+        mlog("il2cpp API: dlsym incomplete");
         return false;
     }
     mlog("il2cpp API: dlsym OK");
@@ -357,92 +343,104 @@ static bool il2cpp_bridge_init(void) {
     if (!asms || !nasm) { mlog("il2cpp: no assemblies"); return false; }
     mlog("il2cpp: %zu assemblies", nasm);
 
-    Il2CppClass camKlass = nullptr;
-    for (size_t i = 0; i < nasm && !camKlass; i++) {
+    Il2CppClass camKlass = nullptr, scrKlass = nullptr;
+    for (size_t i = 0; i < nasm && (!camKlass || !scrKlass); i++) {
         Il2CppImage img = p_assembly_get_image(asms[i]);
         if (!img) continue;
-        camKlass = p_class_from_name(img, "UnityEngine", "Camera");
+        if (!camKlass) camKlass = p_class_from_name(img, "UnityEngine", "Camera");
+        if (!scrKlass) scrKlass = p_class_from_name(img, "UnityEngine", "Screen");
     }
-    if (!camKlass) { mlog("il2cpp: UnityEngine.Camera not found"); return false; }
-    mlog("il2cpp: Camera class @ %p", camKlass);
+    if (!camKlass) { mlog("il2cpp: Camera not found"); return false; }
+    mlog("il2cpp: Camera @ %p  Screen @ %p", camKlass, scrKlass);
 
-    // get_main — direct lookup first (worked before), enum fallback
     g_mi_main = p_class_get_method_from_name(camKlass, "get_main", 0);
-    if (!g_mi_main && p_class_get_methods) {
-        void *iter = nullptr;
-        MethodInfo *mi;
-        while ((mi = p_class_get_methods(camKlass, &iter))) {
-            const char *n = p_method_get_name(mi);
-            if (n && strcmp(n, "get_main") == 0) { g_mi_main = mi; break; }
-        }
-    }
     if (!g_mi_main) { mlog("il2cpp: get_main missing"); return false; }
     mlog("il2cpp: get_main @ %p", (void*)g_mi_main);
 
-    // W2S — ENUMERATE (class_get_method_from_name misses _Injected here)
-    if (p_class_get_methods) {
+    // W2S — enumerate, prefer _Injected
+    if (p_class_get_methods && p_method_get_name) {
         void *iter = nullptr;
         MethodInfo *mi;
         while ((mi = p_class_get_methods(camKlass, &iter))) {
             const char *n = p_method_get_name(mi);
-            if (!n || strncmp(n, "WorldToScreenPoint", 18) != 0) continue;
-            int pc = p_method_get_param_count(mi);
-            mlog("il2cpp: W2S candidate '%s' argc=%d", n, pc);
-            if (pc == 2 && !g_mi_w2s)     { g_mi_w2s = mi; g_w2s_injected = true; }
-            if (pc == 1 && !g_mi_w2s_alt) { g_mi_w2s_alt = mi; }
+            if (!n) continue;
+            if (strcmp(n, "WorldToScreenPoint_Injected") == 0 && !g_mi_w2s) {
+                g_mi_w2s = mi;
+                mlog("il2cpp: W2S = _Injected");
+            }
+            if (strcmp(n, "WorldToScreenPoint") == 0) {
+                mlog("il2cpp: plain W2S also present (kept as backup)");
+            }
         }
     }
-    if (!g_mi_w2s && g_mi_w2s_alt) {
-        g_mi_w2s = g_mi_w2s_alt;
-        g_w2s_injected = false;
-        mlog("il2cpp: using PLAIN W2S via runtime_invoke");
+    if (!g_mi_w2s) g_mi_w2s = p_class_get_method_from_name(camKlass, "WorldToScreenPoint_Injected", 2);
+    if (!g_mi_w2s) g_mi_w2s = p_class_get_method_from_name(camKlass, "WorldToScreenPoint", 1);
+    if (!g_mi_w2s) { mlog("il2cpp: no WorldToScreenPoint"); return false; }
+    mlog("il2cpp: W2S @ %p", (void*)g_mi_w2s);
+
+    if (scrKlass) {
+        g_mi_scr_w = p_class_get_method_from_name(scrKlass, "get_width", 0);
+        g_mi_scr_h = p_class_get_method_from_name(scrKlass, "get_height", 0);
+        mlog("il2cpp: Screen get_width=%p get_height=%p",
+             (void*)g_mi_scr_w, (void*)g_mi_scr_h);
     }
-    if (!g_mi_w2s) { mlog("il2cpp: no usable WorldToScreenPoint"); return false; }
-    mlog("il2cpp: W2S ready (%s) mi=%p",
-         g_w2s_injected ? "Injected" : "plain", (void*)g_mi_w2s);
     return true;
 }
 
-// MethodInfo struct's first field = native fn pointer
 static void *mi_fn(MethodInfo *mi) {
     if (!mi) return nullptr;
     return *(void **)mi;
 }
 
-// ---- main-thread calls ----
 static void* cam_get_main(void) {
     void *fn = mi_fn(g_mi_main);
     if (!fn) return nullptr;
     return ((void *(*)(MethodInfo *))fn)(g_mi_main);
 }
 
-// v13 fix (friend's): _Injected returns Vector3 BY VALUE in s0/s1/s2
-// (HFA, confirmed in disasm tail: ldp x0,s1 / ldr s2 before ret) —
-// NOT through an out pointer. Shape: (cam, &pos, MethodInfo*) -> V3.
-static bool cam_w2s(void *cam, V3 pos, V3 *out) {
+static int32_t screen_get_w(void) {
+    if (!g_mi_scr_w) return 0;
+    void *fn = mi_fn(g_mi_scr_w);
+    if (!fn) return 0;
+    return ((int32_t(*)(MethodInfo *))fn)(g_mi_scr_w);
+}
+static int32_t screen_get_h(void) {
+    if (!g_mi_scr_h) return 0;
+    void *fn = mi_fn(g_mi_scr_h);
+    if (!fn) return 0;
+    return ((int32_t(*)(MethodInfo *))fn)(g_mi_scr_h);
+}
+
+// ---- W2S call shapes ----
+// A: (cam, &pos, mi) -> V3 by value        [friend's — disasm-backed]
+// B: (cam, pos by value, mi) -> V3 by value
+// C: (cam, &pos, &out, mi) -> void          [original ref-out]
+static bool w2s_A(void *cam, V3 pos, V3 *out) {
     void *fn = mi_fn(g_mi_w2s);
-    if (!fn || !cam) return false;
-
-    if (g_w2s_injected) {
-        typedef V3 (*w2s_inj_fn)(void*, V3*, MethodInfo*);
-        V3 r = ((w2s_inj_fn)fn)(cam, &pos, g_mi_w2s);
-        *out = r;
-    } else {
-        // plain WorldToScreenPoint: GC wrapper -> runtime_invoke + unbox
-        if (!p_runtime_invoke || !p_object_unbox) return false;
-        void *params[1] = { &pos };
-        void *exc = nullptr;
-        void *boxed = p_runtime_invoke(g_mi_w2s, cam, params, &exc);
-        if (!boxed || exc) return false;
-        V3 *v = (V3 *)p_object_unbox(boxed);
-        if (!v) return false;
-        *out = *v;
-    }
-
-    if (!(out->x > -1e7f && out->x < 1e7f)) return false;
-    if (!(out->y > -1e7f && out->y < 1e7f)) return false;
-    if (!(out->z > -1e7f && out->z < 1e7f)) return false;
+    if (!fn) return false;
+    typedef V3 (*fnp)(void*, V3*, MethodInfo*);
+    *out = ((fnp)fn)(cam, &pos, g_mi_w2s);
     return true;
+}
+static bool w2s_B(void *cam, V3 pos, V3 *out) {
+    void *fn = mi_fn(g_mi_w2s);
+    if (!fn) return false;
+    typedef V3 (*fnp)(void*, V3, MethodInfo*);
+    *out = ((fnp)fn)(cam, pos, g_mi_w2s);
+    return true;
+}
+static bool w2s_C(void *cam, V3 pos, V3 *out) {
+    void *fn = mi_fn(g_mi_w2s);
+    if (!fn) return false;
+    typedef void (*fnp)(void*, V3*, V3*, MethodInfo*);
+    V3 r{};
+    ((fnp)fn)(cam, &pos, &r, g_mi_w2s);
+    *out = r;
+    return true;
+}
+static bool v3_finite(const V3 &v) {
+    return v.x > -1e7f && v.x < 1e7f && v.y > -1e7f && v.y < 1e7f &&
+           v.z > -1e7f && v.z < 1e7f;
 }
 
 // ---------------- config (in-memory) ----------------
@@ -455,7 +453,6 @@ static EspCfg g_cfg = { true, true, true, true, false, true };
 static bool   g_menu_open = false;
 static bool   g_initialized = false;
 static bool   g_logged_first_frame = false;
-static bool   g_logged_batch = false;
 static CGRect g_btn_rect_v = CGRectMake(611.0f, 8, 48, 48);
 static id<MTLDevice>        g_dev = nil;
 static id<MTLCommandQueue>  g_queue = nil;
@@ -524,7 +521,7 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
 
     CAMetalLayer *l = self.mlayer;
     id<CAMetalDrawable> d = [l nextDrawable];
-    if (!d) { static int nd=0; if(++nd==60) mlog("nextDrawable nil x60"); return; }
+    if (!d) { static int ndl=0; if(++ndl==60) mlog("nextDrawable nil x60"); return; }
 
     MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
     rp.colorAttachments[0].texture = d.texture;
@@ -539,7 +536,6 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
              self.window.bounds.size.width, self.window.bounds.size.height);
     }
 
-    // ---- il2cpp bridge init (once, main thread) ----
     static bool bridged = false;
     if (!bridged) {
         bridged = true;
@@ -561,30 +557,91 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
     f = g_frame;
     os_unfair_lock_unlock(&g_lock);
 
-    // ---- camera: refresh EVERY frame while battle is live (no stale/dying
-    // camera), require 3-frame stability before trusting it ----
+    // ---- camera: refresh every frame while battle live, 3-frame stability ----
     bool battle_live = g_il2cpp_ok && f.entity_count > 0;
     if (battle_live) {
         void *c = cam_get_main();
         if (c && c == g_last_cam) { if (g_cam_stable < 3) g_cam_stable++; }
         else g_cam_stable = 0;
         g_last_cam = c;
-        if (c != g_cam) { g_cam = c; mlog("camera = %p (stable=%d)", c, g_cam_stable); }
+        if (c != g_cam) { g_cam = c; mlog("camera = %p", c); }
     } else {
         g_cam = nullptr; g_cam_stable = 0;
     }
     bool cam_ok = battle_live && g_cam && g_cam_stable >= 3;
 
-    // ---- project entities via the game's own W2S (live camera) ----
+    // ---- W2S coordinate space: ask the game ----
+    static float su_w = 0, su_h = 0;
+    static int   su_tick = 0;
+    if (cam_ok && (++su_tick % 60) == 1) {
+        int w = screen_get_w(), h = screen_get_h();
+        if (w > 0 && h > 0) { su_w = (float)w; su_h = (float)h; }
+    }
+    if (cam_ok && su_w <= 0) {
+        su_w = (float)l.drawableSize.width;
+        su_h = (float)l.drawableSize.height;
+    }
+    float mx = su_w > 0 ? g_screen_w / su_w : 1.0f;
+    float my = su_h > 0 ? g_screen_h / su_h : 1.0f;
+
     struct Draw { float sx, sy, bh, bw; int hp, hpmax; bool ok; };
     static Draw draws[MAX_ENTS];
     int nd = 0, valid = 0;
 
-    float scaleX = (float)l.drawableSize.width  / self.bounds.size.width;
-    float scaleY = (float)l.drawableSize.height / self.bounds.size.height;
-    float pxH    = (float)l.drawableSize.height;
+    typedef bool (*w2s_fn_t)(void*, V3, V3*);
+    w2s_fn_t shapes[3] = { w2s_A, w2s_B, w2s_C };
+    static const char *shape_names[3] = { "A:ref-in", "B:val-in", "C:ref-out" };
 
-    if (cam_ok && !g_w2s_banned) {
+    // ---- shape calibration: SEQUENTIAL (A -> C -> B), 3s window each,
+    // early-lock on a strong hit. Winner drives everything after. ----
+    static int shape = -1;                 // 0=A 1=B 2=C
+    static int calib_pos = 0;
+    static int calib_order[3] = { 0, 2, 1 };
+    static int calib_ticks_in = 0;
+    static int calib_best[3] = { -1, -1, -1 };
+
+    if (cam_ok && shape < 0 && f.entity_count >= 5) {
+        int s = calib_order[calib_pos];
+        int onscreen = 0;
+        V3 dbg{}; bool dbgGot = false;
+        for (uint32_t i = 0; i < f.entity_count && i < MAX_ENTS; i++) {
+            V3 rF{};
+            if (!shapes[s](g_cam, {f.ents[i].wx, f.ents[i].wy, f.ents[i].wz}, &rF)) continue;
+            if (!v3_finite(rF)) continue;
+            if (!dbgGot) { dbg = rF; dbgGot = true; }
+            float sfx = rF.x * mx;
+            float sfy = (su_h - rF.y) * my;
+            if (sfx >= -g_screen_w*0.2f && sfx <= g_screen_w*1.2f &&
+                sfy >= -g_screen_h*0.3f && sfy <= g_screen_h*1.3f)
+                onscreen++;
+        }
+        if (onscreen > calib_best[s]) calib_best[s] = onscreen;
+        if (calib_ticks_in % 60 == 0)
+            mlog("calib %s: on=%d (raw %.1f,%.1f,%.1f)",
+                 shape_names[s], onscreen,
+                 dbgGot ? dbg.x : 0.f, dbgGot ? dbg.y : 0.f, dbgGot ? dbg.z : 0.f);
+        if (onscreen >= (int)f.entity_count - 1) {
+            shape = s;
+            mlog("SHAPE SELECTED: %s (early, on=%d)", shape_names[s], onscreen);
+        } else if (++calib_ticks_in >= 90) {
+            mlog("calib %s window done: best on=%d", shape_names[s], calib_best[s]);
+            calib_ticks_in = 0;
+            calib_pos++;
+            if (calib_pos >= 3) {
+                int win = -1, winScore = -1;
+                for (int k = 0; k < 3; k++)
+                    if (calib_best[calib_order[k]] > winScore) {
+                        winScore = calib_best[calib_order[k]];
+                        win = calib_order[k];
+                    }
+                shape = (win >= 0) ? win : 0;
+                mlog("SHAPE SELECTED: %s (best on=%d)", shape_names[shape], winScore);
+            }
+        }
+    }
+
+    // ---- project entities with the locked shape ----
+    if (cam_ok && shape >= 0) {
         for (uint32_t i = 0; i < f.entity_count && i < MAX_ENTS; i++) {
             EspEnt &e = f.ents[i];
             Draw &dd = draws[nd];
@@ -592,12 +649,12 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
             dd.hp = e.hp; dd.hpmax = e.hpmax;
 
             V3 rF{}, rH{};
-            bool okF = cam_w2s(g_cam, {e.wx, e.wy, e.wz}, &rF) && rF.z > 0.0f;
-            bool okH = okF && cam_w2s(g_cam, {e.wx, e.wy + HERO_H, e.wz}, &rH) && rH.z > 0.0f;
+            bool okF = shapes[shape](g_cam, {e.wx, e.wy, e.wz}, &rF) && v3_finite(rF) && rF.z > 0.0f;
+            bool okH = okF && shapes[shape](g_cam, {e.wx, e.wy + HERO_H, e.wz}, &rH) && v3_finite(rH) && rH.z > 0.0f;
             if (okF && okH) {
-                float sfx = rF.x / scaleX;
-                float sfy = (pxH - rF.y) / scaleY;      // Unity bottom-left -> top-left
-                float shy = (pxH - rH.y) / scaleY;
+                float sfx = rF.x * mx;
+                float sfy = (su_h - rF.y) * my;      // Unity bottom-left -> top-left
+                float shy = (su_h - rH.y) * my;
                 float bh = fabsf(sfy - shy);
                 if (bh >= 2.0f && bh <= 2000.0f) {
                     dd.sx = sfx; dd.sy = sfy;
@@ -606,25 +663,12 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
                     valid++;
                 }
             }
-            if (!dd.ok) { dd.sx = rF.x / scaleX; dd.sy = (pxH - rF.y) / scaleY; }
+            if (!dd.ok) { dd.sx = rF.x * mx; dd.sy = (su_h - rF.y) * my; }
             nd++;
         }
-        if (!g_logged_batch && nd > 0) {
-            g_logged_batch = true;
-            mlog("w2s first batch: %d/%u valid", valid, f.entity_count);
-        }
-        // fail-safe: zero valid for ~3s while battle live -> stop calling
-        static int zero_ticks = 0;
-        if (valid == 0) {
-            if (++zero_ticks >= 90) {
-                g_w2s_banned = true;
-                mlog("W2S DISABLED: 0 valid x90 ticks (shape mismatch?)");
-            }
-        } else zero_ticks = 0;
     }
 
-    // ---- local hero (friend's approximation): entity closest to screen
-    // center across 5+ ticks with sane hp ----
+    // ---- local hero: closest to screen center across 5+ ticks, sane hp ----
     static float local_sx = 0, local_sy = 0;
     static bool  local_valid = false;
     static int   local_streak = 0;
@@ -656,7 +700,7 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
 
     ImDrawList *dl = ImGui::GetBackgroundDrawList();
 
-    if (g_cfg.esp_on) {
+    if (g_cfg.esp_on && shape >= 0) {
         for (int i = 0; i < nd; i++) {
             const Draw &dd = draws[i];
             if (dd.hp <= 0) continue;
@@ -682,7 +726,6 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
                     dl->AddRectFilled(ImVec2(bx, y1 - (y1 - y0) * pct), ImVec2(bx + 3, y1), col_hp);
                 }
 
-                // snapline: local hero -> box CENTER (friend's spec)
                 if (g_cfg.snaplines && local_valid)
                     dl->AddLine(ImVec2(local_sx, local_sy),
                                 ImVec2(dd.sx, dd.sy - dd.bh * 0.5f), col_line, 1.2f);
@@ -713,15 +756,14 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
     if (g_cfg.status_text) {
         char st[224];
         snprintf(st, sizeof st,
-                 "ents=%u dr=%d pos=%c cam=%s loc=%d | e0 w=%.1f,%.1f,%.1f sx=%.0f sy=%.0f bh=%.0f",
+                 "ents=%u dr=%d pos=%c cam=%s shp=%s su=%.0fx%.0f loc=%d | e0 w=%.1f,%.1f,%.1f",
                  f.entity_count, valid, f.pos_sel ? 'B' : 'A',
-                 g_w2s_banned ? "BAN" : (cam_ok ? "ok" : "wait"),
-                 local_valid ? 1 : 0,
+                 cam_ok ? "ok" : "wait",
+                 shape < 0 ? "cal" : shape_names[shape],
+                 su_w, su_h, local_valid ? 1 : 0,
                  f.entity_count ? f.ents[0].wx : 0.f,
                  f.entity_count ? f.ents[0].wy : 0.f,
-                 f.entity_count ? f.ents[0].wz : 0.f,
-                 nd > 0 ? draws[0].sx : 0.f, nd > 0 ? draws[0].sy : 0.f,
-                 nd > 0 ? draws[0].bh : 0.f);
+                 f.entity_count ? f.ents[0].wz : 0.f);
         dl->AddText(ImVec2(8, 30), IM_COL32(0, 220, 255, 255), st);
     }
 
@@ -841,7 +883,7 @@ static void try_create(void) {
     objc_setAssociatedObject(v, "dl", dl, OBJC_ASSOCIATION_RETAIN);
 
     g_initialized = true;
-    mlog("overlay up (v13)");
+    mlog("overlay up (v14)");
 }
 
 static void create_loop(void) {
@@ -857,7 +899,7 @@ static void create_loop(void) {
 
 __attribute__((constructor))
 static void mlb_inject_ctor(void) {
-    mlog("=== ctor fired: VERSION 13 BUILD ===");
+    mlog("=== ctor fired: VERSION 14 BUILD ===");
     create_loop();
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         sleep(3);
