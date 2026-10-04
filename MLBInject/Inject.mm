@@ -1,12 +1,24 @@
 // MLBInject — internal ESP for MLBB (arm64, injected via ElleKit/TrollFools)
-// v19: BACK TO THE PROVEN BASELINE. The memory-scan matrix produced a CORRECT
-// snapline in the first working session, and v11 logs show it re-finding the
-// true matrix repeatedly (on=9/9). v19 = scanner + per-tick revalidation +
-// immediate rescan on stale. NO il2cpp calls at all (v18 crash removed).
-// Projection runs in the WORKER thread (no frame hitches); renderer draws.
+// v20: patch set from external review + NEXRA fixes.
+//   PATCH 1: HERO_H 2.2f -> 4.5f (bigger boxes; un-gates far entities that
+//            projected under the 2px minimum — fixes ents=5 drawn=3 gap)
+//   PATCH 2: per-entity dump every ~2s (names which filter eats a missing ent)
+//   PATCH 3: throttled LOCAL log (validates BM+0x50 against minimap position)
+//   PATCH 4: PENDING — LogicBattleManager+0xA0 fallback waits on the LBM
+//            class slot RVA from the other build
+//   FIX B1:  EspFrame.pos_sel added (renderer referenced a nonexistent member)
+//   FIX B2:  removed `if (addr < size) return false;` in scan_matrix — on iOS
+//            the first region is __PAGEZERO (0..4GB) so the scanner bailed
+//            before reading a single byte
+//   FIX B3:  VP address cache — on stale matrix, re-check last-found slot
+//            first (one read) instead of a full 1-3s cold resweep every time
+//            the camera moves
+//
+// Baseline (proven v11/v19 session): no il2cpp calls, memory-scan matrix with
+// per-tick revalidation, projection in worker thread, renderer draws.
 //   - feet+head world-space box sizing (scale-invariant)
-//   - local player via BattleManager+0x50 (m_LocalPlayerShow, runtime
-//     validated) -> CYAN box; snaplines local hero -> enemy box CENTERS
+//   - local player via BattleManager+0x50 (m_LocalPlayerShow) -> CYAN box;
+//     snaplines local hero -> enemy box CENTERS
 //   - degenerate-matrix guards (zero X-row, sx-spread)
 //   - pos A/B auto-flip, dead=hp-only, vision filter client-side (default off)
 //   - landscape gate + orientation resync, non-key window
@@ -16,7 +28,7 @@
 //   Hp 0x1AC / HpMax 0x1B0  <- get_m_HpPer
 //   CanSight 0x254          <- get_m_CanSight
 //   Pos A 0x1D0 / Pos B 0x298 <- get_Position tail paths (B verified live)
-//   Local player: BM+0x50 (m_LocalPlayerShow — runtime-validated)
+//   Local player: BM+0x50 (m_LocalPlayerShow — runtime-validated, PATCH 3 log)
 //   List: auto-probe (locks BM+0x78 m_ShowPlayers)
 
 #import <UIKit/UIKit.h>
@@ -80,7 +92,9 @@ static void mlog(const char *fmt, ...) {
 #define OFF_ENT_POS_B        0x298
 #define OFF_BM_LOCALSHOW     0x50      // m_LocalPlayerShow (old dump, validated)
 
-#define HERO_H               2.2f      // world-units hero height; tune 2.0-4.0
+// PATCH 1: was 2.2f — far heroes projected under the 2px box gate and got
+// silently skipped. Tune: too tall -> 3.8, too short -> 5.5.
+#define HERO_H               4.5f
 #define MAX_ENTS             64
 
 static float g_screen_w = 667.0f;
@@ -97,6 +111,7 @@ typedef struct {
 typedef struct {
     uint32_t entity_count;
     uint32_t matrix_ok;
+    int32_t  pos_sel;                 // FIX B1: 0=A, 1=B (renderer reads this)
     int32_t  local_ok;                // BM+0x50 probe succeeded
     float    local_sx, local_sy, local_bh;
     int32_t  local_drawn;             // local hero projected on-screen
@@ -136,6 +151,7 @@ static uint64_t uf_base(void) {
 static uint64_t g_uf = 0;
 static int      g_list_off = -1;
 static int      g_pos_sel = 1;
+static uint64_t g_last_vp_addr = 0;   // FIX B3: cached VP slot for fast re-check
 
 typedef struct KlassCache { uint64_t obj; bool hero; } KlassCache;
 static KlassCache g_kcache[512];
@@ -260,6 +276,7 @@ static bool scan_region_for_vp(uint64_t addr, uint64_t len,
             if (!finite) continue;
             if (vp_score(m, es, n) > 0) {
                 memcpy(g_vp, m, sizeof(g_vp));
+                g_last_vp_addr = addr + off + o;    // FIX B3: remember the slot
                 return true;
             }
         }
@@ -268,6 +285,16 @@ static bool scan_region_for_vp(uint64_t addr, uint64_t len,
 }
 
 static bool scan_matrix(const Snap *es, int n) {
+    // FIX B3 fast path: camera rewrites VP into the same buffer slot almost
+    // every time — one read beats a 1-3s cold sweep
+    if (g_last_vp_addr) {
+        float m[16];
+        if (rd(g_last_vp_addr, m, sizeof m) && vp_score(m, es, n) > 0) {
+            memcpy(g_vp, m, sizeof g_vp);
+            return true;
+        }
+    }
+
     mach_vm_address_t addr = 1;
     uint64_t budget = 64ull * 1024 * 1024;   // per-tick budget; continues next tick
     while (budget > 0) {
@@ -279,7 +306,9 @@ static bool scan_matrix(const Snap *es, int n) {
                 VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &cnt, &obj);
         if (kr != KERN_SUCCESS) return false;
         if (obj) mach_port_deallocate(mach_task_self(), obj);
-        if (addr < size) return false;
+        // FIX B2: removed `if (addr < size) return false;` — first region on
+        // iOS is __PAGEZERO (0..4GB), so this bailed before scanning anything
+
         if ((info.protection & VM_PROT_READ) &&
             !(info.protection & VM_PROT_EXECUTE) &&
             size <= 512ull * 1024 * 1024) {
@@ -298,6 +327,9 @@ static void worker_loop(void) {
     static uint64_t probe_bm = 0;
     static bool probe_logged = false, probe_fail_logged = false;
     static int rescans = 0;
+
+    // PATCH 2: entity dump throttle (~every 2s at 10Hz)
+    static int dbg_tick = 0;
 
     for (;;) {
         if (!g_uf) {
@@ -320,6 +352,7 @@ static void worker_loop(void) {
             os_unfair_lock_lock(&g_lock); g_frame = f; os_unfair_lock_unlock(&g_lock);
             g_list_off = -1; g_mat_ok = false; g_kcache_n = 0;
             g_pos_sel = 1; g_uf = 0;
+            g_last_vp_addr = 0;               // FIX B3: slot is dead after lobby
             sleep(1); continue;
         }
         uint64_t statics = rd64(klass + OFF_CLASS_STATICS);
@@ -329,6 +362,7 @@ static void worker_loop(void) {
             snprintf(f.status, sizeof f.status, "lobby (no battle instance)");
             os_unfair_lock_lock(&g_lock); g_frame = f; os_unfair_lock_unlock(&g_lock);
             g_list_off = -1; g_mat_ok = false; g_kcache_n = 0; g_pos_sel = 1;
+            g_last_vp_addr = 0;
             usleep(500000); continue;
         }
         if (g_list_off < 0) {
@@ -352,6 +386,11 @@ static void worker_loop(void) {
         float move_a = 0, move_b = 0;
         EspFrame f;
         memset(&f, 0, sizeof f);
+
+        // PATCH 2: dump buffer
+        bool dbg = (++dbg_tick % 20) == 0;
+        char dbgbuf[1024] = {0};
+        int dbgoff = 0;
 
         for (int32_t i = 0; i < size && count < MAX_ENTS; i++) {
             uint64_t e = rd64(arr + 0x20 + 8ull * (uint64_t)i);
@@ -391,9 +430,19 @@ static void worker_loop(void) {
                 en->box_h = bh;
                 en->box_w = bh * 0.55f;
             }
+
+            // PATCH 2: per-entity dump line
+            if (dbg && dbgoff < (int)sizeof(dbgbuf) - 128)
+                dbgoff += snprintf(dbgbuf + dbgoff, sizeof(dbgbuf) - dbgoff,
+                    "[%d] hp=%d/%d bh=%.0f sx=%.0f sy=%.0f vis=%d dead=%d\n",
+                    count, en->hp, en->hpmax, en->box_h, en->sx, en->sy,
+                    en->visible, en->dead);
+
             count++;
         }
         prev_n = count;
+
+        if (dbg && dbgoff) mlog("ents dump:\n%s", dbgbuf);
 
         if (move_a < 0.01f && move_b > 0.5f && g_pos_sel == 0) {
             g_pos_sel = 1;
@@ -441,6 +490,16 @@ static void worker_loop(void) {
                     mlog("local player via BM+0x50: ShowPlayer @ 0x%llx",
                          (unsigned long long)lshow);
                 }
+
+                // PATCH 3: throttled LOCAL verification log — compare wp
+                // against your minimap position. Mismatch = BM+0x50 wrong
+                // for this build -> switch to LogicBattleManager+0xA0 path
+                static int local_log_tick = 0;
+                if ((++local_log_tick % 20) == 1) {
+                    mlog("LOCAL: ptr=0x%llx wp=(%.1f,%.1f,%.1f) sx=%.0f sy=%.0f drawn=%d",
+                         (unsigned long long)lshow, lx, ly, lz,
+                         f.local_sx, f.local_sy, f.local_drawn);
+                }
             }
         }
         if (!f.local_ok && !probe_fail_logged && count > 0) {
@@ -449,6 +508,7 @@ static void worker_loop(void) {
         }
 
         f.matrix_ok = g_mat_ok ? 1 : 0;
+        f.pos_sel   = g_pos_sel;          // FIX B1
         f.entity_count = count;
         snprintf(f.status, sizeof f.status, "ents=%d mat=%s pos=%c",
                  count, g_mat_ok ? "ok" : "scan", g_pos_sel ? 'B' : 'A');
@@ -635,9 +695,10 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
 
     if (g_cfg.status_text) {
         char st[192];
-               snprintf(st, sizeof st,
+        snprintf(st, sizeof st,
                  "ents=%u mat=%s pos=%c loc=%s | e0 sx=%.0f sy=%.0f bh=%.0f hp=%d",
-                 f.entity_count, f.matrix_ok ? "ok" : "scan", g_pos_sel ? 'B' : 'A',
+                 f.entity_count, f.matrix_ok ? "ok" : "scan",
+                 f.pos_sel ? 'B' : 'A',
                  f.local_ok ? (f.local_drawn ? "ptr+scr" : "ptr") : "no",
                  f.entity_count ? f.ents[0].sx : 0.f,
                  f.entity_count ? f.ents[0].sy : 0.f,
@@ -762,7 +823,7 @@ static void try_create(void) {
     objc_setAssociatedObject(v, "dl", dl, OBJC_ASSOCIATION_RETAIN);
 
     g_initialized = true;
-    mlog("overlay up (v19 scanner-baseline)");
+    mlog("overlay up (v20 patch-build)");
 }
 
 static void create_loop(void) {
@@ -778,7 +839,7 @@ static void create_loop(void) {
 
 __attribute__((constructor))
 static void mlb_inject_ctor(void) {
-    mlog("=== ctor fired: VERSION 19 BUILD (scanner-baseline) ===");
+    mlog("=== ctor fired: VERSION 20 BUILD (patch set: HERO_H + dumps + LOCAL log + VP cache) ===");
     create_loop();
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         sleep(3);
