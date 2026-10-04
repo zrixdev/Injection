@@ -103,6 +103,7 @@ static bool rd(uint64_t addr, void *out, size_t len) {
             (mach_vm_size_t)len, (mach_vm_address_t)(uintptr_t)out, &got)
             == KERN_SUCCESS && got == len;
 }
+static uint64_t rd64(uint64_t a)  { uint64_t v = 0; return rd(a, &v, 8) ? v : 0; }
 static int32_t  rdi32(uint64_t a) { int32_t  v = 0; return rd(a, &v, 4) ? v : 0; }
 static bool rd_vec3(uint64_t a, float o[3]) { return rd(a, o, 12); }
 static bool rd_cstr(uint64_t addr, char *out, size_t cap) {
