@@ -1,11 +1,8 @@
 // MLBInject — internal ESP for MLBB (arm64, injected via ElleKit/TrollFools)
-// v12: METADATA-RESOLVED W2S — no RVAs, no matrix scanning. Resolves
+// v12a: METADATA-RESOLVED W2S — no RVAs, no matrix scanning. Resolves
 // UnityEngine.Camera + get_main + WorldToScreenPoint_Injected via the
-// il2cpp exported API (dlsym), then calls the game's own projection on the
-// main thread every frame — always the LIVE camera. Zero-RVA = update-proof.
-// Same architecture as confirmed-working MLBB cheats (metadata, not RVA).
-// Carried: landscape gate + resync, non-key window, dead=hp-only,
-// e0 debug status, orange boxes / green HP / orange snaplines.
+// il2cpp exported API (dlsym), calls the game's own projection on the main
+// thread every frame — always the LIVE camera. Zero-RVA = update-proof.
 //
 // Data offsets (verified via iGODGame disassembly):
 //   BM class slot 0x7BFBF70 / statics 0xA8 / Instance 0x0  <- get_battleManager
@@ -282,17 +279,24 @@ static void worker_loop(void) {
 }
 
 // ---------------- il2cpp metadata bridge (zero RVA) ----------------
+// Real exported signatures:
+//   Il2CppDomain*          il2cpp_domain_get(void)
+//   void**                 il2cpp_domain_get_assemblies(domain, size_t* size)
+//   Il2CppImage            il2cpp_assembly_get_image(assembly)
+//   Il2CppClass            il2cpp_class_from_name(image, ns, name)
+//   const MethodInfo*      il2cpp_class_get_method_from_name(klass, name, argc)
+// MethodInfo struct: first field = methodPointer (the native fn).
 typedef void*       Il2CppDomain;
 typedef void*       Il2CppAssembly;
 typedef void*       Il2CppImage;
 typedef void*       Il2CppClass;
-typedef void*       MethodInfo;          // we pass MethodInfo* to callers
+typedef void        MethodInfo;      // opaque; we hold MethodInfo* (ptr to struct)
 
-typedef Il2CppDomain       (*fn_domain_get)(void);
-typedef void               (*fn_domain_get_assemblies)(Il2CppDomain, size_t*, Il2CppAssembly**);
-typedef Il2CppImage        (*fn_assembly_get_image)(Il2CppAssembly);
-typedef Il2CppClass        (*fn_class_from_name)(Il2CppImage, const char*, const char*);
-typedef MethodInfo*        (*fn_class_get_method)(Il2CppClass, const char*, int);
+typedef Il2CppDomain (*fn_domain_get)(void);
+typedef void**       (*fn_domain_get_assemblies)(Il2CppDomain, size_t*);
+typedef Il2CppImage  (*fn_assembly_get_image)(Il2CppAssembly);
+typedef Il2CppClass  (*fn_class_from_name)(Il2CppImage, const char*, const char*);
+typedef MethodInfo*  (*fn_class_get_method)(Il2CppClass, const char*, int);
 
 static fn_domain_get            p_domain_get;
 static fn_domain_get_assemblies p_domain_get_assemblies;
@@ -300,24 +304,20 @@ static fn_assembly_get_image    p_assembly_get_image;
 static fn_class_from_name       p_class_from_name;
 static fn_class_get_method      p_class_get_method_from_name;
 
-static bool       g_il2cpp_ok = false;
-static MethodInfo g_mi_main = nullptr;   // Camera.get_main
-static MethodInfo g_mi_w2s  = nullptr;   // Camera.WorldToScreenPoint_Injected
-static void*      g_cam = nullptr;
-static int        g_cam_refresh = 0;
+static bool        g_il2cpp_ok = false;
+static MethodInfo *g_mi_main = nullptr;   // &MethodInfo of Camera.get_main
+static MethodInfo *g_mi_w2s  = nullptr;   // &MethodInfo of W2S_Injected
+static void*       g_cam = nullptr;
+static int         g_cam_refresh = 0;
 
 struct V3 { float x, y, z; };
 
 static bool il2cpp_bridge_init(void) {
-    p_domain_get = (fn_domain_get)dlsym(RTLD_DEFAULT, "il2cpp_domain_get");
-    p_domain_get_assemblies =
-        (fn_domain_get_assemblies)dlsym(RTLD_DEFAULT, "il2cpp_domain_get_assemblies");
-    p_assembly_get_image =
-        (fn_assembly_get_image)dlsym(RTLD_DEFAULT, "il2cpp_assembly_get_image");
-    p_class_from_name =
-        (fn_class_from_name)dlsym(RTLD_DEFAULT, "il2cpp_class_from_name");
-    p_class_get_method_from_name =
-        (fn_class_get_method)dlsym(RTLD_DEFAULT, "il2cpp_class_get_method_from_name");
+    p_domain_get                = (fn_domain_get)dlsym(RTLD_DEFAULT, "il2cpp_domain_get");
+    p_domain_get_assemblies     = (fn_domain_get_assemblies)dlsym(RTLD_DEFAULT, "il2cpp_domain_get_assemblies");
+    p_assembly_get_image        = (fn_assembly_get_image)dlsym(RTLD_DEFAULT, "il2cpp_assembly_get_image");
+    p_class_from_name           = (fn_class_from_name)dlsym(RTLD_DEFAULT, "il2cpp_class_from_name");
+    p_class_get_method_from_name= (fn_class_get_method)dlsym(RTLD_DEFAULT, "il2cpp_class_get_method_from_name");
 
     if (!p_domain_get || !p_domain_get_assemblies || !p_assembly_get_image ||
         !p_class_from_name || !p_class_get_method_from_name) {
@@ -330,8 +330,7 @@ static bool il2cpp_bridge_init(void) {
     if (!dom) { mlog("il2cpp: domain null"); return false; }
 
     size_t nasm = 0;
-    Il2CppAssembly **asms = nullptr;
-    p_domain_get_assemblies(dom, &nasm, &asms);
+    void **asms = p_domain_get_assemblies(dom, &nasm);
     if (!asms || !nasm) { mlog("il2cpp: no assemblies"); return false; }
     mlog("il2cpp: %zu assemblies", nasm);
 
@@ -350,22 +349,29 @@ static bool il2cpp_bridge_init(void) {
         mlog("il2cpp: methods missing (main=%p w2s=%p)", (void*)miMain, (void*)miW2S);
         return false;
     }
-    g_mi_main = *miMain;   // MethodInfo* -> MethodInfo (struct holds fn ptr)
-    g_mi_w2s  = *miW2S;
-    mlog("il2cpp: methods resolved — main=%p w2s=%p", g_mi_main, g_mi_w2s);
+    g_mi_main = miMain;   // keep the MethodInfo* — passed as trailing arg on call
+    g_mi_w2s  = miW2S;
+    mlog("il2cpp: methods resolved — main=%p w2s=%p", (void*)g_mi_main, (void*)g_mi_w2s);
     return true;
 }
 
-// ---- main-thread calls into the game ----
-// il2cpp instance-call convention: (self, args..., MethodInfo* last)
+// MethodInfo struct's first field is the native fn pointer — read it.
+static void *mi_fn(MethodInfo *mi) {
+    if (!mi) return nullptr;
+    return *(void **)mi;
+}
+
+// ---- main-thread calls (il2cpp convention: last arg = MethodInfo*) ----
 static void* cam_get_main(void) {
-    if (!g_mi_main) return nullptr;
-    return ((void*(*)(MethodInfo*))g_mi_main)(g_mi_main);
+    void *fn = mi_fn(g_mi_main);
+    if (!fn) return nullptr;
+    return ((void *(*)(MethodInfo *))fn)(g_mi_main);
 }
 
 static bool cam_w2s(void *cam, V3 pos, V3 *out) {
-    if (!g_mi_w2s || !cam) return false;
-    ((void(*)(void*, V3*, V3*, MethodInfo*))g_mi_w2s)(cam, &pos, out, g_mi_w2s);
+    void *fn = mi_fn(g_mi_w2s);
+    if (!fn || !cam) return false;
+    ((void (*)(void *, V3 *, V3 *, MethodInfo *))fn)(cam, &pos, out, g_mi_w2s);
     if (!(out->x > -1e7f && out->x < 1e7f && out->y > -1e7f && out->y < 1e7f))
         return false;
     return true;
@@ -720,7 +726,7 @@ static void try_create(void) {
     objc_setAssociatedObject(v, "dl", dl, OBJC_ASSOCIATION_RETAIN);
 
     g_initialized = true;
-    mlog("overlay up (v12 w2s-metadata)");
+    mlog("overlay up (v12a w2s-metadata)");
 }
 
 static void create_loop(void) {
@@ -736,7 +742,7 @@ static void create_loop(void) {
 
 __attribute__((constructor))
 static void mlb_inject_ctor(void) {
-    mlog("=== ctor fired: VERSION 12 BUILD (w2s-metadata) ===");
+    mlog("=== ctor fired: VERSION 12A BUILD (w2s-metadata) ===");
     create_loop();
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         sleep(3);
