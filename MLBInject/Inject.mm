@@ -2,13 +2,14 @@
 // v13: DISASM-GROUNDED W2S.
 //   - W2S resolved by METHOD ENUMERATION (class_get_method_from_name misses
 //     _Injected on this build) — logs every candidate name+argc.
-//   - Injected shape confirmed from disasm: (self, in V3*, ref V3*, MethodInfo*).
-//   - Plain WorldToScreenPoint is a GC wrapper (disasm) -> runtime_invoke+unbox
-//     path if only the plain overload resolves.
+//   - Injected shape (friend's fix, confirmed by disasm): Vector3 returned
+//     BY VALUE in s0/s1/s2 — call is (cam, &pos, mi) -> V3.
+//   - Plain WorldToScreenPoint is a GC wrapper (disasm) -> runtime_invoke
+//     + object_unbox path if only the plain overload resolves.
 //   - Crash guards: camera refreshed EVERY frame, 3-frame stability gate,
 //     project only when battle list live, W2S auto-disable on garbage.
-//   - Friend's snapline: local hero approx (closest-to-center 5+ ticks, sane
-//     hp), lines from local to box CENTERS.
+//   - Friend's snapline: local hero approx (closest-to-center 5+ ticks,
+//     sane hp), lines from local to box CENTERS.
 // Carried: landscape gate + resync, non-key window, dead=hp-only, e0 status,
 // orange boxes / green HP.
 //
@@ -318,7 +319,7 @@ static bool        g_il2cpp_ok   = false;
 static MethodInfo *g_mi_main     = nullptr;
 static MethodInfo *g_mi_w2s      = nullptr;   // preferred: Injected (argc==2)
 static MethodInfo *g_mi_w2s_alt  = nullptr;   // fallback: plain (argc==1)
-static bool        g_w2s_injected = false;    // true -> direct shape
+static bool        g_w2s_injected = false;    // true -> direct by-value shape
 static bool        g_w2s_banned  = false;     // auto-disabled on garbage
 static void*       g_cam = nullptr;
 static void*       g_last_cam = nullptr;
@@ -415,14 +416,19 @@ static void* cam_get_main(void) {
     return ((void *(*)(MethodInfo *))fn)(g_mi_main);
 }
 
-// returns false on garbage; out untouched on failure
+// v13 fix (friend's): _Injected returns Vector3 BY VALUE in s0/s1/s2
+// (HFA, confirmed in disasm tail: ldp x0,s1 / ldr s2 before ret) —
+// NOT through an out pointer. Shape: (cam, &pos, MethodInfo*) -> V3.
 static bool cam_w2s(void *cam, V3 pos, V3 *out) {
-    if (!g_mi_w2s || !cam) return false;
+    void *fn = mi_fn(g_mi_w2s);
+    if (!fn || !cam) return false;
+
     if (g_w2s_injected) {
-        void *fn = mi_fn(g_mi_w2s);
-        if (!fn) return false;
-        ((void (*)(void *, V3 *, V3 *, MethodInfo *))fn)(cam, &pos, out, g_mi_w2s);
+        typedef V3 (*w2s_inj_fn)(void*, V3*, MethodInfo*);
+        V3 r = ((w2s_inj_fn)fn)(cam, &pos, g_mi_w2s);
+        *out = r;
     } else {
+        // plain WorldToScreenPoint: GC wrapper -> runtime_invoke + unbox
         if (!p_runtime_invoke || !p_object_unbox) return false;
         void *params[1] = { &pos };
         void *exc = nullptr;
@@ -432,9 +438,10 @@ static bool cam_w2s(void *cam, V3 pos, V3 *out) {
         if (!v) return false;
         *out = *v;
     }
-    if (!(out->x > -1e7f && out->x < 1e7f && out->y > -1e7f && out->y < 1e7f &&
-          out->z > -1e7f && out->z < 1e7f))
-        return false;
+
+    if (!(out->x > -1e7f && out->x < 1e7f)) return false;
+    if (!(out->y > -1e7f && out->y < 1e7f)) return false;
+    if (!(out->z > -1e7f && out->z < 1e7f)) return false;
     return true;
 }
 
@@ -606,11 +613,10 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
             g_logged_batch = true;
             mlog("w2s first batch: %d/%u valid", valid, f.entity_count);
         }
-        // fail-safe: if we keep getting zero valid while battle is live, stop
-        // calling (prevents crash-loops on a wrong-shaped method)
+        // fail-safe: zero valid for ~3s while battle live -> stop calling
         static int zero_ticks = 0;
         if (valid == 0) {
-            if (++zero_ticks >= 90) {   // ~3s of nothing
+            if (++zero_ticks >= 90) {
                 g_w2s_banned = true;
                 mlog("W2S DISABLED: 0 valid x90 ticks (shape mismatch?)");
             }
