@@ -1,8 +1,16 @@
 // MLBInject — internal ESP for MLBB (arm64, injected via ElleKit/TrollFools)
-// v12b: W2S VARIANT LOOP — your build's Camera has WorldToScreenPoint but the
-// _Injected name/argc combo didn't match; we now try every known variant and
-// log which one matched. Rest identical to v12a (metadata bridge, zero RVA,
-// main-thread W2S, live camera).
+// v13: DISASM-GROUNDED W2S.
+//   - W2S resolved by METHOD ENUMERATION (class_get_method_from_name misses
+//     _Injected on this build) — logs every candidate name+argc.
+//   - Injected shape confirmed from disasm: (self, in V3*, ref V3*, MethodInfo*).
+//   - Plain WorldToScreenPoint is a GC wrapper (disasm) -> runtime_invoke+unbox
+//     path if only the plain overload resolves.
+//   - Crash guards: camera refreshed EVERY frame, 3-frame stability gate,
+//     project only when battle list live, W2S auto-disable on garbage.
+//   - Friend's snapline: local hero approx (closest-to-center 5+ ticks, sane
+//     hp), lines from local to box CENTERS.
+// Carried: landscape gate + resync, non-key window, dead=hp-only, e0 status,
+// orange boxes / green HP.
 //
 // Data offsets (verified via iGODGame disassembly):
 //   BM class slot 0x7BFBF70 / statics 0xA8 / Instance 0x0  <- get_battleManager
@@ -267,8 +275,7 @@ static void worker_loop(void) {
 
         f.pos_sel = (uint32_t)g_pos_sel;
         f.entity_count = count;
-        snprintf(f.status, sizeof f.status, "ents=%d pos=%c w2s=?",
-                 count, g_pos_sel ? 'B' : 'A');
+        snprintf(f.status, sizeof f.status, "ents=%d pos=%c", count, g_pos_sel ? 'B' : 'A');
 
         os_unfair_lock_lock(&g_lock);
         g_frame = f;
@@ -283,42 +290,63 @@ typedef void*       Il2CppDomain;
 typedef void*       Il2CppAssembly;
 typedef void*       Il2CppImage;
 typedef void*       Il2CppClass;
-typedef void        MethodInfo;      // opaque; hold MethodInfo* (ptr to struct)
+typedef void        MethodInfo;      // opaque — we hold MethodInfo*
 
 typedef Il2CppDomain (*fn_domain_get)(void);
 typedef void**       (*fn_domain_get_assemblies)(Il2CppDomain, size_t*);
 typedef Il2CppImage  (*fn_assembly_get_image)(Il2CppAssembly);
 typedef Il2CppClass  (*fn_class_from_name)(Il2CppImage, const char*, const char*);
 typedef MethodInfo*  (*fn_class_get_method)(Il2CppClass, const char*, int);
+typedef MethodInfo*  (*fn_class_get_methods)(Il2CppClass, void**);   // enumerator
+typedef const char*  (*fn_method_get_name)(MethodInfo*);
+typedef int          (*fn_method_get_param_count)(MethodInfo*);
+typedef void*        (*fn_runtime_invoke)(MethodInfo*, void*, void**, void**);
+typedef void*        (*fn_object_unbox)(void*);
 
 static fn_domain_get            p_domain_get;
 static fn_domain_get_assemblies p_domain_get_assemblies;
 static fn_assembly_get_image    p_assembly_get_image;
 static fn_class_from_name       p_class_from_name;
 static fn_class_get_method      p_class_get_method_from_name;
+static fn_class_get_methods     p_class_get_methods;
+static fn_method_get_name       p_method_get_name;
+static fn_method_get_param_count p_method_get_param_count;
+static fn_runtime_invoke        p_runtime_invoke;
+static fn_object_unbox          p_object_unbox;
 
-static bool        g_il2cpp_ok = false;
-static MethodInfo *g_mi_main = nullptr;
-static MethodInfo *g_mi_w2s  = nullptr;
-static bool        g_w2s_injected_variant = false;   // affects call shape
+static bool        g_il2cpp_ok   = false;
+static MethodInfo *g_mi_main     = nullptr;
+static MethodInfo *g_mi_w2s      = nullptr;   // preferred: Injected (argc==2)
+static MethodInfo *g_mi_w2s_alt  = nullptr;   // fallback: plain (argc==1)
+static bool        g_w2s_injected = false;    // true -> direct shape
+static bool        g_w2s_banned  = false;     // auto-disabled on garbage
 static void*       g_cam = nullptr;
-static int         g_cam_refresh = 0;
+static void*       g_last_cam = nullptr;
+static int         g_cam_stable = 0;
 
 struct V3 { float x, y, z; };
 
 static bool il2cpp_bridge_init(void) {
-    p_domain_get                = (fn_domain_get)dlsym(RTLD_DEFAULT, "il2cpp_domain_get");
-    p_domain_get_assemblies     = (fn_domain_get_assemblies)dlsym(RTLD_DEFAULT, "il2cpp_domain_get_assemblies");
-    p_assembly_get_image        = (fn_assembly_get_image)dlsym(RTLD_DEFAULT, "il2cpp_assembly_get_image");
-    p_class_from_name           = (fn_class_from_name)dlsym(RTLD_DEFAULT, "il2cpp_class_from_name");
-    p_class_get_method_from_name= (fn_class_get_method)dlsym(RTLD_DEFAULT, "il2cpp_class_get_method_from_name");
+    p_domain_get                 = (fn_domain_get)dlsym(RTLD_DEFAULT, "il2cpp_domain_get");
+    p_domain_get_assemblies      = (fn_domain_get_assemblies)dlsym(RTLD_DEFAULT, "il2cpp_domain_get_assemblies");
+    p_assembly_get_image         = (fn_assembly_get_image)dlsym(RTLD_DEFAULT, "il2cpp_assembly_get_image");
+    p_class_from_name            = (fn_class_from_name)dlsym(RTLD_DEFAULT, "il2cpp_class_from_name");
+    p_class_get_method_from_name = (fn_class_get_method)dlsym(RTLD_DEFAULT, "il2cpp_class_get_method_from_name");
+    p_class_get_methods          = (fn_class_get_methods)dlsym(RTLD_DEFAULT, "il2cpp_class_get_methods");
+    p_method_get_name            = (fn_method_get_name)dlsym(RTLD_DEFAULT, "il2cpp_method_get_name");
+    p_method_get_param_count     = (fn_method_get_param_count)dlsym(RTLD_DEFAULT, "il2cpp_method_get_param_count");
+    p_runtime_invoke             = (fn_runtime_invoke)dlsym(RTLD_DEFAULT, "il2cpp_runtime_invoke");
+    p_object_unbox               = (fn_object_unbox)dlsym(RTLD_DEFAULT, "il2cpp_object_unbox");
 
     if (!p_domain_get || !p_domain_get_assemblies || !p_assembly_get_image ||
-        !p_class_from_name || !p_class_get_method_from_name) {
-        mlog("il2cpp API: symbols NOT exported (dlsym failed)");
+        !p_class_from_name || !p_class_get_method_from_name ||
+        !p_class_get_methods || !p_method_get_name || !p_method_get_param_count) {
+        mlog("il2cpp API: dlsym incomplete (core=%d enum=%d)",
+             !!(p_domain_get && p_class_from_name && p_class_get_method_from_name),
+             !!(p_class_get_methods && p_method_get_name && p_method_get_param_count));
         return false;
     }
-    mlog("il2cpp API: dlsym OK — resolving UnityEngine.Camera");
+    mlog("il2cpp API: dlsym OK");
 
     Il2CppDomain dom = p_domain_get();
     if (!dom) { mlog("il2cpp: domain null"); return false; }
@@ -334,36 +362,43 @@ static bool il2cpp_bridge_init(void) {
         if (!img) continue;
         camKlass = p_class_from_name(img, "UnityEngine", "Camera");
     }
-    if (!camKlass) { mlog("il2cpp: UnityEngine.Camera class not found"); return false; }
+    if (!camKlass) { mlog("il2cpp: UnityEngine.Camera not found"); return false; }
     mlog("il2cpp: Camera class @ %p", camKlass);
 
-    MethodInfo *miMain = p_class_get_method_from_name(camKlass, "get_main", 0);
-    if (!miMain) miMain = p_class_get_method_from_name(camKlass, "get_main", -1);
-
-    MethodInfo *miW2S = nullptr;
-    static const char *w2s_names[] = {
-        "WorldToScreenPoint_Injected", "WorldToScreenPoint",
-        "WorldToScreenPoint_1", "WorldToScreenPoint_2"
-    };
-    for (size_t i = 0; i < sizeof(w2s_names)/sizeof(w2s_names[0]) && !miW2S; i++) {
-        miW2S = p_class_get_method_from_name(camKlass, w2s_names[i], -1);
-        if (miW2S) {
-            mlog("il2cpp: W2S variant matched: %s", w2s_names[i]);
-            g_w2s_injected_variant = (i == 0);
+    // get_main — direct lookup first (worked before), enum fallback
+    g_mi_main = p_class_get_method_from_name(camKlass, "get_main", 0);
+    if (!g_mi_main && p_class_get_methods) {
+        void *iter = nullptr;
+        MethodInfo *mi;
+        while ((mi = p_class_get_methods(camKlass, &iter))) {
+            const char *n = p_method_get_name(mi);
+            if (n && strcmp(n, "get_main") == 0) { g_mi_main = mi; break; }
         }
     }
-    if (!miW2S) {
-        mlog("il2cpp: no WorldToScreenPoint variant found on Camera");
-        return false;
+    if (!g_mi_main) { mlog("il2cpp: get_main missing"); return false; }
+    mlog("il2cpp: get_main @ %p", (void*)g_mi_main);
+
+    // W2S — ENUMERATE (class_get_method_from_name misses _Injected here)
+    if (p_class_get_methods) {
+        void *iter = nullptr;
+        MethodInfo *mi;
+        while ((mi = p_class_get_methods(camKlass, &iter))) {
+            const char *n = p_method_get_name(mi);
+            if (!n || strncmp(n, "WorldToScreenPoint", 18) != 0) continue;
+            int pc = p_method_get_param_count(mi);
+            mlog("il2cpp: W2S candidate '%s' argc=%d", n, pc);
+            if (pc == 2 && !g_mi_w2s)     { g_mi_w2s = mi; g_w2s_injected = true; }
+            if (pc == 1 && !g_mi_w2s_alt) { g_mi_w2s_alt = mi; }
+        }
     }
-    if (!miMain) {
-        mlog("il2cpp: get_main missing too");
-        return false;
+    if (!g_mi_w2s && g_mi_w2s_alt) {
+        g_mi_w2s = g_mi_w2s_alt;
+        g_w2s_injected = false;
+        mlog("il2cpp: using PLAIN W2S via runtime_invoke");
     }
-    g_mi_main = miMain;
-    g_mi_w2s  = miW2S;
-    mlog("il2cpp: methods resolved — main=%p w2s=%p",
-         (void*)g_mi_main, (void*)g_mi_w2s);
+    if (!g_mi_w2s) { mlog("il2cpp: no usable WorldToScreenPoint"); return false; }
+    mlog("il2cpp: W2S ready (%s) mi=%p",
+         g_w2s_injected ? "Injected" : "plain", (void*)g_mi_w2s);
     return true;
 }
 
@@ -380,22 +415,25 @@ static void* cam_get_main(void) {
     return ((void *(*)(MethodInfo *))fn)(g_mi_main);
 }
 
+// returns false on garbage; out untouched on failure
 static bool cam_w2s(void *cam, V3 pos, V3 *out) {
-    void *fn = mi_fn(g_mi_w2s);
-    if (!fn || !cam) return false;
-    if (g_w2s_injected_variant) {
-        // (self, in Vector3, ref Vector3 ret, MethodInfo*)
+    if (!g_mi_w2s || !cam) return false;
+    if (g_w2s_injected) {
+        void *fn = mi_fn(g_mi_w2s);
+        if (!fn) return false;
         ((void (*)(void *, V3 *, V3 *, MethodInfo *))fn)(cam, &pos, out, g_mi_w2s);
     } else {
-        // plain WorldToScreenPoint returns a boxed Vector3
-        // il2cpp object: [0]=klass, [8]=monitor, [0x10]=float x, [0x14]=y, [0x18]=z
-        void *boxed = ((void *(*)(void *, MethodInfo *))fn)(cam, g_mi_w2s);
-        if (!boxed) return false;
-        rd((uint64_t)boxed + 0x10, out, 12);
-        // free the box via il2cpp GC if available — leak is tiny (one per
-        // entity per frame), and freeing foreign GC objects is riskier
+        if (!p_runtime_invoke || !p_object_unbox) return false;
+        void *params[1] = { &pos };
+        void *exc = nullptr;
+        void *boxed = p_runtime_invoke(g_mi_w2s, cam, params, &exc);
+        if (!boxed || exc) return false;
+        V3 *v = (V3 *)p_object_unbox(boxed);
+        if (!v) return false;
+        *out = *v;
     }
-    if (!(out->x > -1e7f && out->x < 1e7f && out->y > -1e7f && out->y < 1e7f))
+    if (!(out->x > -1e7f && out->x < 1e7f && out->y > -1e7f && out->y < 1e7f &&
+          out->z > -1e7f && out->z < 1e7f))
         return false;
     return true;
 }
@@ -410,6 +448,7 @@ static EspCfg g_cfg = { true, true, true, true, false, true };
 static bool   g_menu_open = false;
 static bool   g_initialized = false;
 static bool   g_logged_first_frame = false;
+static bool   g_logged_batch = false;
 static CGRect g_btn_rect_v = CGRectMake(611.0f, 8, 48, 48);
 static id<MTLDevice>        g_dev = nil;
 static id<MTLCommandQueue>  g_queue = nil;
@@ -500,15 +539,6 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
         g_il2cpp_ok = il2cpp_bridge_init();
     }
 
-    // ---- camera (main thread; refresh ~8s or when null) ----
-    if (g_il2cpp_ok && (!g_cam || (++g_cam_refresh % 240) == 0)) {
-        void *c = cam_get_main();
-        if (c != g_cam) {
-            g_cam = c;
-            mlog("camera = %p", c);
-        }
-    }
-
     ImGui::SetCurrentContext(g_imgui);
     ImGuiIO &io = ImGui::GetIO();
     io.DisplaySize = ImVec2(self.bounds.size.width, self.bounds.size.height);
@@ -524,6 +554,20 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
     f = g_frame;
     os_unfair_lock_unlock(&g_lock);
 
+    // ---- camera: refresh EVERY frame while battle is live (no stale/dying
+    // camera), require 3-frame stability before trusting it ----
+    bool battle_live = g_il2cpp_ok && f.entity_count > 0;
+    if (battle_live) {
+        void *c = cam_get_main();
+        if (c && c == g_last_cam) { if (g_cam_stable < 3) g_cam_stable++; }
+        else g_cam_stable = 0;
+        g_last_cam = c;
+        if (c != g_cam) { g_cam = c; mlog("camera = %p (stable=%d)", c, g_cam_stable); }
+    } else {
+        g_cam = nullptr; g_cam_stable = 0;
+    }
+    bool cam_ok = battle_live && g_cam && g_cam_stable >= 3;
+
     // ---- project entities via the game's own W2S (live camera) ----
     struct Draw { float sx, sy, bh, bw; int hp, hpmax; bool ok; };
     static Draw draws[MAX_ENTS];
@@ -533,7 +577,7 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
     float scaleY = (float)l.drawableSize.height / self.bounds.size.height;
     float pxH    = (float)l.drawableSize.height;
 
-    if (g_il2cpp_ok && g_cam && f.entity_count > 0) {
+    if (cam_ok && !g_w2s_banned) {
         for (uint32_t i = 0; i < f.entity_count && i < MAX_ENTS; i++) {
             EspEnt &e = f.ents[i];
             Draw &dd = draws[nd];
@@ -558,16 +602,55 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
             if (!dd.ok) { dd.sx = rF.x / scaleX; dd.sy = (pxH - rF.y) / scaleY; }
             nd++;
         }
+        if (!g_logged_batch && nd > 0) {
+            g_logged_batch = true;
+            mlog("w2s first batch: %d/%u valid", valid, f.entity_count);
+        }
+        // fail-safe: if we keep getting zero valid while battle is live, stop
+        // calling (prevents crash-loops on a wrong-shaped method)
+        static int zero_ticks = 0;
+        if (valid == 0) {
+            if (++zero_ticks >= 90) {   // ~3s of nothing
+                g_w2s_banned = true;
+                mlog("W2S DISABLED: 0 valid x90 ticks (shape mismatch?)");
+            }
+        } else zero_ticks = 0;
     }
-    static bool logged_batch = false;
-    if (!logged_batch && g_il2cpp_ok && g_cam && nd > 0) {
-        logged_batch = true;
-        mlog("w2s first batch: %d/%u valid", valid, f.entity_count);
+
+    // ---- local hero (friend's approximation): entity closest to screen
+    // center across 5+ ticks with sane hp ----
+    static float local_sx = 0, local_sy = 0;
+    static bool  local_valid = false;
+    static int   local_streak = 0;
+    {
+        int best = -1;
+        float bestD = 1e9f;
+        float cx = io.DisplaySize.x * 0.5f, cy = io.DisplaySize.y * 0.5f;
+        for (int i = 0; i < nd; i++) {
+            if (!draws[i].ok) continue;
+            if (draws[i].hp <= 0 || draws[i].hpmax <= 0 ||
+                draws[i].hp > draws[i].hpmax * 4) continue;
+            float bcx = draws[i].sx;
+            float bcy = draws[i].sy - draws[i].bh * 0.5f;
+            float dd2 = (bcx-cx)*(bcx-cx) + (bcy-cy)*(bcy-cy);
+            if (dd2 < bestD) { bestD = dd2; best = i; }
+        }
+        if (best >= 0 && bestD < 220.0f * 220.0f) {
+            if (local_streak < 10) local_streak++;
+            if (local_streak >= 5) {
+                local_sx = draws[best].sx;
+                local_sy = draws[best].sy - draws[best].bh * 0.5f;
+                local_valid = true;
+            }
+        } else {
+            local_streak = 0;
+            local_valid = false;
+        }
     }
 
     ImDrawList *dl = ImGui::GetBackgroundDrawList();
 
-    if (g_cfg.esp_on && g_cam && g_il2cpp_ok) {
+    if (g_cfg.esp_on) {
         for (int i = 0; i < nd; i++) {
             const Draw &dd = draws[i];
             if (dd.hp <= 0) continue;
@@ -593,9 +676,10 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
                     dl->AddRectFilled(ImVec2(bx, y1 - (y1 - y0) * pct), ImVec2(bx + 3, y1), col_hp);
                 }
 
-                if (g_cfg.snaplines)
-                    dl->AddLine(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y),
-                                ImVec2(dd.sx, y1), col_line, 1.2f);
+                // snapline: local hero -> box CENTER (friend's spec)
+                if (g_cfg.snaplines && local_valid)
+                    dl->AddLine(ImVec2(local_sx, local_sy),
+                                ImVec2(dd.sx, dd.sy - dd.bh * 0.5f), col_line, 1.2f);
             } else if (dd.sx != 0 || dd.sy != 0) {
                 dl->AddCircleFilled(ImVec2(dd.sx, dd.sy), 3.0f, IM_COL32(255, 0, 255, 255));
             }
@@ -623,8 +707,10 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
     if (g_cfg.status_text) {
         char st[224];
         snprintf(st, sizeof st,
-                 "ents=%u dr=%d pos=%c | e0 w=%.1f,%.1f,%.1f sx=%.0f sy=%.0f bh=%.0f",
+                 "ents=%u dr=%d pos=%c cam=%s loc=%d | e0 w=%.1f,%.1f,%.1f sx=%.0f sy=%.0f bh=%.0f",
                  f.entity_count, valid, f.pos_sel ? 'B' : 'A',
+                 g_w2s_banned ? "BAN" : (cam_ok ? "ok" : "wait"),
+                 local_valid ? 1 : 0,
                  f.entity_count ? f.ents[0].wx : 0.f,
                  f.entity_count ? f.ents[0].wy : 0.f,
                  f.entity_count ? f.ents[0].wz : 0.f,
@@ -749,7 +835,7 @@ static void try_create(void) {
     objc_setAssociatedObject(v, "dl", dl, OBJC_ASSOCIATION_RETAIN);
 
     g_initialized = true;
-    mlog("overlay up (v12b w2s-metadata)");
+    mlog("overlay up (v13)");
 }
 
 static void create_loop(void) {
@@ -765,7 +851,7 @@ static void create_loop(void) {
 
 __attribute__((constructor))
 static void mlb_inject_ctor(void) {
-    mlog("=== ctor fired: VERSION 12B BUILD (w2s-metadata) ===");
+    mlog("=== ctor fired: VERSION 13 BUILD ===");
     create_loop();
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         sleep(3);
