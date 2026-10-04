@@ -3,6 +3,7 @@
 // UnityEngine.Camera + get_main + WorldToScreenPoint_Injected via the
 // il2cpp exported API (dlsym), then calls the game's own projection on the
 // main thread every frame — always the LIVE camera. Zero-RVA = update-proof.
+// Same architecture as confirmed-working MLBB cheats (metadata, not RVA).
 // Carried: landscape gate + resync, non-key window, dead=hp-only,
 // e0 debug status, orange boxes / green HP / orange snaplines.
 //
@@ -174,7 +175,7 @@ static int discover_list(uint64_t bm) {
     return -1;
 }
 
-// ---------------- worker thread (data only — no Unity calls) -------------
+// ---------------- worker thread (data only — no Unity calls here) --------
 static void worker_loop(void) {
     static float prev_a[MAX_ENTS][3], prev_b[MAX_ENTS][3];
     static int prev_n = 0;
@@ -281,32 +282,42 @@ static void worker_loop(void) {
 }
 
 // ---------------- il2cpp metadata bridge (zero RVA) ----------------
-typedef void* Il2CppDomain;
-typedef void* Il2CppAssembly;
-typedef void* Il2CppImage;
-typedef void* Il2CppClass;
-typedef void* MethodInfo;
+typedef void*       Il2CppDomain;
+typedef void*       Il2CppAssembly;
+typedef void*       Il2CppImage;
+typedef void*       Il2CppClass;
+typedef void*       MethodInfo;          // we pass MethodInfo* to callers
 
-static Il2CppDomain (*p_domain_get)(void);
-static size_t       (*p_domain_get_assemblies)(Il2CppDomain, Il2CppAssembly**);
-static Il2CppImage  (*p_assembly_get_image)(Il2CppAssembly);
-static Il2CppClass  (*p_class_from_name)(Il2CppImage, const char*, const char*);
-static MethodInfo   (*p_class_get_method_from_name)(Il2CppClass, const char*, int);
+typedef Il2CppDomain       (*fn_domain_get)(void);
+typedef void               (*fn_domain_get_assemblies)(Il2CppDomain, size_t*, Il2CppAssembly**);
+typedef Il2CppImage        (*fn_assembly_get_image)(Il2CppAssembly);
+typedef Il2CppClass        (*fn_class_from_name)(Il2CppImage, const char*, const char*);
+typedef MethodInfo*        (*fn_class_get_method)(Il2CppClass, const char*, int);
 
-static bool   g_il2cpp_ok = false;
+static fn_domain_get            p_domain_get;
+static fn_domain_get_assemblies p_domain_get_assemblies;
+static fn_assembly_get_image    p_assembly_get_image;
+static fn_class_from_name       p_class_from_name;
+static fn_class_get_method      p_class_get_method_from_name;
+
+static bool       g_il2cpp_ok = false;
 static MethodInfo g_mi_main = nullptr;   // Camera.get_main
 static MethodInfo g_mi_w2s  = nullptr;   // Camera.WorldToScreenPoint_Injected
-static void*  g_cam = nullptr;
-static int    g_cam_refresh = 0;
+static void*      g_cam = nullptr;
+static int        g_cam_refresh = 0;
 
 struct V3 { float x, y, z; };
 
 static bool il2cpp_bridge_init(void) {
-    p_domain_get = (decltype(p_domain_get))dlsym(RTLD_DEFAULT, "il2cpp_domain_get");
-    p_domain_get_assemblies = (decltype(p_domain_get_assemblies))dlsym(RTLD_DEFAULT, "il2cpp_domain_get_assemblies");
-    p_assembly_get_image = (decltype(p_assembly_get_image))dlsym(RTLD_DEFAULT, "il2cpp_assembly_get_image");
-    p_class_from_name = (decltype(p_class_from_name))dlsym(RTLD_DEFAULT, "il2cpp_class_from_name");
-    p_class_get_method_from_name = (decltype(p_class_get_method_from_name))dlsym(RTLD_DEFAULT, "il2cpp_class_get_method_from_name");
+    p_domain_get = (fn_domain_get)dlsym(RTLD_DEFAULT, "il2cpp_domain_get");
+    p_domain_get_assemblies =
+        (fn_domain_get_assemblies)dlsym(RTLD_DEFAULT, "il2cpp_domain_get_assemblies");
+    p_assembly_get_image =
+        (fn_assembly_get_image)dlsym(RTLD_DEFAULT, "il2cpp_assembly_get_image");
+    p_class_from_name =
+        (fn_class_from_name)dlsym(RTLD_DEFAULT, "il2cpp_class_from_name");
+    p_class_get_method_from_name =
+        (fn_class_get_method)dlsym(RTLD_DEFAULT, "il2cpp_class_get_method_from_name");
 
     if (!p_domain_get || !p_domain_get_assemblies || !p_assembly_get_image ||
         !p_class_from_name || !p_class_get_method_from_name) {
@@ -320,15 +331,7 @@ static bool il2cpp_bridge_init(void) {
 
     size_t nasm = 0;
     Il2CppAssembly **asms = nullptr;
-    p_domain_get_assemblies(dom, &asms);
-    // il2cpp_domain_get_assemblies fills size via the out param — read it:
-    // signature: Assembly** assemblies(domain, size_t* size) in C; the C
-    // export is: Assembly** il2cpp_domain_get_assemblies(domain, size_t* size)
-    // so re-fetch properly:
-    static size_t (*p_dga)(Il2CppDomain, size_t*) =
-        (size_t(*)(Il2CppDomain, size_t*))dlsym(RTLD_DEFAULT, "il2cpp_domain_get_assemblies");
-    if (!p_dga) { mlog("il2cpp: assemblies fn missing"); return false; }
-    asms = p_dga(dom, &nasm);
+    p_domain_get_assemblies(dom, &nasm, &asms);
     if (!asms || !nasm) { mlog("il2cpp: no assemblies"); return false; }
     mlog("il2cpp: %zu assemblies", nasm);
 
@@ -341,37 +344,28 @@ static bool il2cpp_bridge_init(void) {
     if (!camKlass) { mlog("il2cpp: UnityEngine.Camera class not found"); return false; }
     mlog("il2cpp: Camera class @ %p", camKlass);
 
-    g_mi_main = p_class_get_method_from_name(camKlass, "get_main", 0);
-    g_mi_w2s  = p_class_get_method_from_name(camKlass, "WorldToScreenPoint_Injected", 2);
-    if (!g_mi_main || !g_mi_w2s) {
-        mlog("il2cpp: methods missing (main=%p w2s=%p)", g_mi_main, g_mi_w2s);
+    MethodInfo *miMain = p_class_get_method_from_name(camKlass, "get_main", 0);
+    MethodInfo *miW2S  = p_class_get_method_from_name(camKlass, "WorldToScreenPoint_Injected", 2);
+    if (!miMain || !miW2S) {
+        mlog("il2cpp: methods missing (main=%p w2s=%p)", (void*)miMain, (void*)miW2S);
         return false;
     }
+    g_mi_main = *miMain;   // MethodInfo* -> MethodInfo (struct holds fn ptr)
+    g_mi_w2s  = *miW2S;
     mlog("il2cpp: methods resolved — main=%p w2s=%p", g_mi_main, g_mi_w2s);
     return true;
 }
 
-// MethodInfo layout: methodPointer is the first field
-static void *mi_ptr(MethodInfo mi) {
-    void *p = nullptr;
-    if (!mi || !rd((uint64_t)mi, &p, sizeof(p))) return nullptr;
-    return p;
-}
-
 // ---- main-thread calls into the game ----
+// il2cpp instance-call convention: (self, args..., MethodInfo* last)
 static void* cam_get_main(void) {
-    void *fn = mi_ptr(g_mi_main);
-    if (!fn) return nullptr;
-    return ((void*(*)(MethodInfo*))fn)(g_mi_main);
+    if (!g_mi_main) return nullptr;
+    return ((void*(*)(MethodInfo*))g_mi_main)(g_mi_main);
 }
 
-// WorldToScreenPoint_Injected(in Vector3 pos, ref Vector3 ret)
-// il2cpp instance call: f(self, &pos, &ret, MethodInfo*)
 static bool cam_w2s(void *cam, V3 pos, V3 *out) {
-    void *fn = mi_ptr(g_mi_w2s);
-    if (!fn || !cam) return false;
-    ((void(*)(void*, V3*, V3*, MethodInfo*))fn)(cam, &pos, out, g_mi_w2s);
-    // sanity: finite output
+    if (!g_mi_w2s || !cam) return false;
+    ((void(*)(void*, V3*, V3*, MethodInfo*))g_mi_w2s)(cam, &pos, out, g_mi_w2s);
     if (!(out->x > -1e7f && out->x < 1e7f && out->y > -1e7f && out->y < 1e7f))
         return false;
     return true;
@@ -523,7 +517,6 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
             if (okF && okH) {
                 float sfx = rF.x / scaleX;
                 float sfy = (pxH - rF.y) / scaleY;      // Unity bottom-left -> top-left
-                float shx = rH.x / scaleX;
                 float shy = (pxH - rH.y) / scaleY;
                 float bh = fabsf(sfy - shy);
                 if (bh >= 2.0f && bh <= 2000.0f) {
