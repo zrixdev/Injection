@@ -635,9 +635,9 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
 
     if (g_cfg.status_text) {
         char st[192];
-        snprintf(st, sizeof st,
+               snprintf(st, sizeof st,
                  "ents=%u mat=%s pos=%c loc=%s | e0 sx=%.0f sy=%.0f bh=%.0f hp=%d",
-                 f.entity_count, f.matrix_ok ? "ok" : "scan", f.pos_sel ? 'B' : 'A',
+                 f.entity_count, f.matrix_ok ? "ok" : "scan", g_pos_sel ? 'B' : 'A',
                  f.local_ok ? (f.local_drawn ? "ptr+scr" : "ptr") : "no",
                  f.entity_count ? f.ents[0].sx : 0.f,
                  f.entity_count ? f.ents[0].sy : 0.f,
