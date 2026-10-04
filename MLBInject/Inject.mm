@@ -1,9 +1,9 @@
 // MLBInject — internal ESP for MLBB (arm64, injected via ElleKit/TrollFools)
-// v8: screen dims taken from the live scene (no hardcoded 667x375 assumption),
-// corrected Y mapping (+0.0f — Unity NDC is already bottom-up), carried-over
-// v7 wins: dead=hp-only, snaps-before-projection, per-tick debug status,
-// matrix validated with the same feet+head math as runtime, auto-rescan,
-// image-3 style orange boxes / green HP / orange snaplines.
+// v9: ORIENTATION FIX — overlay view is created only once the scene is
+// landscape, and re-syncs to scene.screen.bounds every ~0.5s so a portrait
+// moment at cold-start can never poison the view. All v8 features carried:
+// live screen dims, corrected Y mapping, dead=hp-only, snaps-before-projection,
+// e0 debug status, matrix revalidation, auto-rescan, orange/green style.
 //
 // Offset provenance (verified via iGODGame disassembly):
 //   BM class slot 0x7BFBF70 / statics 0xA8 / Instance 0x0  <- get_battleManager
@@ -75,7 +75,7 @@ static void mlog(const char *fmt, ...) {
 #define HERO_H               2.2f     // world-units hero height; tune 2.0-4.0
 #define MAX_ENTS             64
 
-// live screen dims (points) — filled from the scene at overlay creation
+// live screen dims (points) — synced from scene every ~0.5s
 static float g_screen_w = 667.0f;
 static float g_screen_h = 375.0f;
 
@@ -180,8 +180,6 @@ static int discover_list(uint64_t bm) {
 }
 
 // ---------------- projection ----------------
-// Uses LIVE screen dims. If MLBB's matrix targets pixel space, everything
-// scales linearly and g_screen_w/h just absorbs it (validation adapts too).
 static bool project(float x, float y, float z, float *sx, float *sy, float *cw) {
     float cx = g_vp[0]*x + g_vp[4]*y + g_vp[8]*z  + g_vp[12];
     float cy = g_vp[1]*x + g_vp[5]*y + g_vp[9]*z  + g_vp[13];
@@ -189,7 +187,7 @@ static bool project(float x, float y, float z, float *sx, float *sy, float *cw) 
     *cw = w;
     if (w <= 0.001f) return false;   // behind camera
     *sx = (cx / w * 0.5f + 0.5f) * g_screen_w;
-    *sy = (1.0f - (cy / w * 0.5f + 0.0f)) * g_screen_h;   // no double flip
+    *sy = (1.0f - (cy / w * 0.5f + 0.0f)) * g_screen_h;
     return true;
 }
 
@@ -202,14 +200,13 @@ static float project_box(float x, float y, float z,
     *sx = sfx; *sy = sfy;
     if (cw_out) *cw_out = cwf;
     float bh = fabsf(sfy - shy);
-    if (bh < 2.0f || bh > 2000.0f) return 0;   // broken height axis -> reject
+    if (bh < 2.0f || bh > 2000.0f) return 0;
     return bh;
 }
 
 // ---------------- camera matrix scan ----------------
 typedef struct Snap { float x, y, z; } Snap;
 
-// validate with the SAME feet+head box projection used at runtime
 static int vp_score(const float m[16], const Snap *es, int n) {
     float save[16];
     memcpy(save, g_vp, sizeof(save));
@@ -345,7 +342,6 @@ static void worker_loop(void) {
             if (!rd_vec3(e + OFF_ENT_POS_A, pa)) continue;
             if (!rd_vec3(e + OFF_ENT_POS_B, pb)) continue;
 
-            // movement tracking — ALWAYS, before everything
             if (count < prev_n) {
                 move_a += fabsf(pa[0]-prev_a[count][0]) + fabsf(pa[2]-prev_a[count][2]);
                 move_b += fabsf(pb[0]-prev_b[count][0]) + fabsf(pb[2]-prev_b[count][2]);
@@ -353,7 +349,6 @@ static void worker_loop(void) {
             memcpy(prev_a[count], pa, 12);
             memcpy(prev_b[count], pb, 12);
 
-            // fill matrix-scan snapshot BEFORE any projection logic
             if (snap_n < MAX_ENTS) {
                 snaps[snap_n].x = (g_pos_sel == 0) ? pa[0] : pb[0];
                 snaps[snap_n].y = (g_pos_sel == 0) ? pa[1] : pb[1];
@@ -361,12 +356,11 @@ static void worker_loop(void) {
                 snap_n++;
             }
 
-            // reserve the slot — entity is COUNTED no matter what
             EspEnt *en = &f.ents[count];
             en->hp      = rdi32(e + OFF_ENT_HP);
             en->hpmax   = rdi32(e + OFF_ENT_HPMAX);
             en->visible = rdi32(e + OFF_ENT_CANSIGHT);
-            en->dead    = (en->hp <= 0);   // 0xD0 unverified — hp-only
+            en->dead    = (en->hp <= 0);
             en->sx = 0; en->sy = 0; en->box_h = 0; en->box_w = 0;
 
             float fx = (g_pos_sel == 0) ? pa[0] : pb[0];
@@ -385,7 +379,6 @@ static void worker_loop(void) {
         }
         prev_n = count;
 
-        // bidirectional auto-flip on frozen position set
         if (move_a < 0.01f && move_b > 0.5f && g_pos_sel == 0) {
             g_pos_sel = 1;
             mlog("auto-flip A->B (A frozen)");
@@ -396,7 +389,6 @@ static void worker_loop(void) {
 
         if (!g_mat_ok && snap_n >= 3) g_mat_ok = scan_matrix(snaps, snap_n);
 
-        // rescan if matrix "ok" but nothing valid for ~1s (wrong/stale matrix)
         if (g_mat_ok && drawn == 0 && count > 0) {
             if (++g_bad_box_ticks >= 10) {
                 g_mat_ok = false;
@@ -409,7 +401,6 @@ static void worker_loop(void) {
         f.pos_sel   = (uint32_t)g_pos_sel;
         f.entity_count = count;
 
-        // v8 debug: entity 0 raw numbers on the status line
         if (count > 0) {
             snprintf(f.status, sizeof f.status,
                      "ents=%d dr=%d pos=%c | e0 sx=%.0f sy=%.0f bh=%.0f hp=%d",
@@ -424,7 +415,7 @@ static void worker_loop(void) {
         g_frame = f;
         os_unfair_lock_unlock(&g_lock);
 
-        usleep(100000);   // 10 Hz
+        usleep(100000);
     }
 }
 
@@ -438,7 +429,7 @@ static EspCfg g_cfg = { true, true, true, true, false, true };
 static bool   g_menu_open = false;
 static bool   g_initialized = false;
 static bool   g_logged_first_frame = false;
-static CGRect g_btn_rect_v = CGRectMake(611.0f, 8, 48, 48);   // top-right in landscape pts
+static CGRect g_btn_rect_v = CGRectMake(611.0f, 8, 48, 48);
 static id<MTLDevice>        g_dev = nil;
 static id<MTLCommandQueue>  g_queue = nil;
 static ImGuiContext        *g_imgui = nil;
@@ -484,6 +475,22 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
 
 - (void)drawFrame {
     if (!g_initialized) return;
+
+    // v9: orientation re-sync — if the scene's screen dims changed (cold-start
+    // portrait -> game landscape, or any drift), resize to match. ~2x/sec.
+    static int _sync = 0;
+    if ((++_sync % 15) == 0 && self.window.scene) {
+        CGRect sb = self.window.scene.screen.bounds;
+        if (fabsf(sb.size.width  - self.bounds.size.width)  > 0.5f ||
+            fabsf(sb.size.height - self.bounds.size.height) > 0.5f) {
+            self.frame = CGRectMake(0, 0, sb.size.width, sb.size.height);
+            g_screen_w = (float)sb.size.width;
+            g_screen_h = (float)sb.size.height;
+            [self syncSize];
+            mlog("resync view -> %.0fx%.0f", sb.size.width, sb.size.height);
+        }
+    }
+
     [self syncSize];
 
     CAMetalLayer *l = self.mlayer;
@@ -498,8 +505,9 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
 
     if (!g_logged_first_frame) {
         g_logged_first_frame = true;
-        mlog("manual metal first frame (%.0fx%.0f px)",
-             l.drawableSize.width, l.drawableSize.height);
+        mlog("manual metal first frame view=%.0fx%.0f window=%.0fx%.0f",
+             self.bounds.size.width, self.bounds.size.height,
+             self.window.bounds.size.width, self.window.bounds.size.height);
     }
 
     ImGui::SetCurrentContext(g_imgui);
@@ -524,7 +532,6 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
             const EspEnt &e = f.ents[i];
             if (e.dead) continue;
 
-            // image-3 style colors
             const ImU32 col_box  = IM_COL32(255, 165, 0, 255);   // orange
             const ImU32 col_line = IM_COL32(255, 165, 0, 180);
             const ImU32 col_hpbg = IM_COL32(0, 0, 0, 180);
@@ -550,13 +557,12 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
                     dl->AddLine(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y),
                                 ImVec2(e.sx, y1), col_line, 1.2f);
             } else if (e.sx != 0 || e.sy != 0) {
-                // box projection failed but feet projected: magenta debug dot
                 dl->AddCircleFilled(ImVec2(e.sx, e.sy), 3.0f, IM_COL32(255, 0, 255, 255));
             }
         }
     }
 
-    // toggle button — anchored to the LIVE display size, top-right
+    // toggle button — anchored to live display size, top-right
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 56, 8));
     ImGui::PushStyleColor(ImGuiCol_WindowBg, 0);
     ImGui::Begin("##btn", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
@@ -621,7 +627,6 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
 @interface ESPWindow : UIWindow
 @end
 @implementation ESPWindow
-// never become key — the game's window keeps the responder chain
 - (BOOL)canBecomeKeyWindow { return NO; }
 
 - (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)e {
@@ -630,7 +635,7 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
     CGPoint local = [v convertPoint:p fromView:self];
     if (g_menu_open) return v;
     if (CGRectContainsPoint(g_btn_rect_v, local)) return v;
-    return nil;   // pass everything else through to the game
+    return nil;
 }
 @end
 
@@ -652,8 +657,17 @@ static void try_create(void) {
     UIWindowScene *scene = find_scene();
     if (!scene) return;
 
+    // v9: REFUSE portrait — cold-start catches the app before it forces
+    // landscape; creating here poisons the view with 375x667 forever.
+    CGRect sb = scene.screen.bounds;
+    if (sb.size.width < sb.size.height) {
+        static bool logged_wait = false;
+        if (!logged_wait) { logged_wait = true; mlog("waiting for landscape orientation..."); }
+        return;
+    }
+
     static bool logged = false;
-    if (!logged) { logged = true; mlog("scene found, creating overlay"); }
+    if (!logged) { logged = true; mlog("scene found (landscape), creating overlay"); }
 
     g_dev = MTLCreateSystemDefaultDevice();
     if (!g_dev) { mlog("ERROR: no Metal device"); return; }
@@ -667,8 +681,7 @@ static void try_create(void) {
     g_win.rootViewController = [UIViewController new];
     g_win.rootViewController.view.backgroundColor = [UIColor clearColor];
 
-    // LIVE screen dims — replaces all hardcoded 667x375 assumptions
-    CGRect sb = scene.screen.bounds;
+    // live landscape dims
     g_screen_w = (float)sb.size.width;
     g_screen_h = (float)sb.size.height;
     mlog("screen pts: %.0f x %.0f", g_screen_w, g_screen_h);
@@ -694,7 +707,7 @@ static void try_create(void) {
     objc_setAssociatedObject(v, "dl", dl, OBJC_ASSOCIATION_RETAIN);
 
     g_initialized = true;
-    mlog("overlay up (v8)");
+    mlog("overlay up (v9)");
 }
 
 static void create_loop(void) {
@@ -703,14 +716,14 @@ static void create_loop(void) {
     static int attempts = 0;
     attempts++;
     if (attempts == 3 || attempts == 30 || attempts == 150)
-        mlog("still hunting scene (attempt %d)...", attempts);
+        mlog("hunting scene/orientation (attempt %d)...", attempts);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
                    dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ create_loop(); });
 }
 
 __attribute__((constructor))
 static void mlb_inject_ctor(void) {
-    mlog("=== ctor fired: VERSION 8 BUILD ===");
+    mlog("=== ctor fired: VERSION 9 BUILD ===");
     create_loop();
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         sleep(3);
