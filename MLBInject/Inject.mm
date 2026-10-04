@@ -1,11 +1,13 @@
 // MLBInject — internal ESP for MLBB (arm64, injected via ElleKit/TrollFools)
-// v15: MATRIX-FROM-CAMERA — end of call-shape roulette. Resolves
-// Camera.get_worldToCameraMatrix + get_projectionMatrix via metadata,
-// calls them with runtime_invoke (universal marshaling — boxes the 4x4),
-// multiplies VP = P*V (both orders tested live, winner locked), projects
-// with the proven v9 math using Screen.width/height (measured).
-// Local hero gets a CYAN marker; snaplines run local-hero -> enemy centers.
-// Carried: landscape gate + resync, non-key window, dead=hp-only, e0 status.
+// v16: ROW-MAJOR FIX — the transpose bug found by the v15 log (ndc ny stable
+// ~2.6, w stuck at 1 = affine = transposed matrices). Unity stores matrices
+// ROW-MAJOR (m[r*4+c], translation in m[3],m[7],m[11]); mat_vec/mat_mul now
+// use the correct convention. Matrices fetched from the LIVE camera via
+// runtime_invoke (get_worldToCameraMatrix + get_projectionMatrix), both
+// multiply orders auto-tested, winner locked. Local hero = CYAN box;
+// snaplines run local hero -> enemy box CENTERS (friend's spec).
+// Carried: landscape gate + resync, non-key window, dead=hp-only, e0 status,
+// orange boxes / green HP.
 //
 // Data offsets (verified via iGODGame disassembly):
 //   BM class slot 0x7BFBF70 / statics 0xA8 / Instance 0x0  <- get_battleManager
@@ -396,18 +398,19 @@ static int32_t screen_get_h(void) {
     return ((int32_t(*)(MethodInfo *))fn)(g_mi_scr_h);
 }
 
-// ---------------- matrix math (column-major, Unity layout) ----------------
-// m[c*4+r]; viewPos = V*pos; clip = P*viewPos
+// ---------------- matrix math (Unity ROW-major storage) ----------------
+// m[r*4+c]; clip = M * (v, w) — column-vector convention, correct multiply
 static void mat_vec(const float m[16], const V3 &v, float w, float out[4]) {
     for (int r = 0; r < 4; r++)
-        out[r] = m[0*4+r]*v.x + m[1*4+r]*v.y + m[2*4+r]*v.z + m[3*4+r]*w;
+        out[r] = m[r*4+0]*v.x + m[r*4+1]*v.y + m[r*4+2]*v.z + m[r*4+3]*w;
 }
+// out = A * B (row-major, column-vector convention)
 static void mat_mul(float out[16], const float a[16], const float b[16]) {
-    for (int c = 0; c < 4; c++)
-        for (int r = 0; r < 4; r++) {
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++) {
             float s = 0;
-            for (int k = 0; k < 4; k++) s += a[k*4+r] * b[c*4+k];
-            out[c*4+r] = s;
+            for (int k = 0; k < 4; k++) s += a[r*4+k] * b[k*4+c];
+            out[r*4+c] = s;
         }
 }
 
@@ -561,14 +564,14 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
     }
 
     // ---- build VP for both multiply orders, auto-pick by on-screen count ----
-    static int conv = -1;             // 0 = VP=P*V, 1 = VP=V*P
+    static int conv = -1;             // 0 = VP=P*V (standard), 1 = VP=V*P
     static int conv_good_ticks[2] = {0,0};
     static int conv_dbg_tick = 0;
 
     float VP1[16], VP2[16];
     if (mats_ok) {
         mat_mul(VP1, P, V);          // standard: clip = P * V * pos
-        mat_mul(VP2, V, P);          // fallback: covers transposed-read errors
+        mat_mul(VP2, V, P);          // fallback: covers storage-order surprises
     }
 
     struct Draw { float sx, sy, bh, bw; int hp, hpmax; bool ok; };
@@ -579,6 +582,7 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
         // score both conventions
         int on[2] = {0,0};
         V3 dbg[2] = {{0,0,0},{0,0,0}};
+        float dbgW[2] = {0,0};
         for (int cv = 0; cv < 2; cv++) {
             const float *vp = (cv == 0) ? VP1 : VP2;
             for (uint32_t i = 0; i < f.entity_count && i < MAX_ENTS; i++) {
@@ -587,22 +591,21 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
                 if (o[3] <= 0.001f) continue;
                 float nx = o[0]/o[3], ny = o[1]/o[3];
                 if (!(fabsf(nx) < 10 && fabsf(ny) < 10)) continue;
-                if (!dbg[cv].x && !dbg[cv].y) dbg[cv] = {nx, ny, o[2]};
+                if (!dbg[cv].x && !dbg[cv].y) { dbg[cv] = {nx, ny, o[2]}; dbgW[cv] = o[3]; }
                 float sfx = (nx*0.5f + 0.5f) * su_w * mx;
                 float sfy = (1.0f - (ny*0.5f + 0.5f)) * su_h * my;
                 if (sfx >= 0 && sfx <= g_screen_w && sfy >= 0 && sfy <= g_screen_h)
                     on[cv]++;
             }
         }
-        // lock after 2 consecutive strong ticks; early-log for diagnosis
         if (conv < 0) {
             for (int cv = 0; cv < 2; cv++) {
                 if (on[cv] >= (int)f.entity_count - 1) conv_good_ticks[cv]++;
                 else conv_good_ticks[cv] = 0;
             }
             if (++conv_dbg_tick % 30 == 1)
-                mlog("mats: on(P*V)=%d on(V*P)=%d raw ndc e0 = %.3f,%.3f,%.3f",
-                     on[0], on[1], dbg[0].x, dbg[0].y, dbg[0].z);
+                mlog("mats: on(P*V)=%d on(V*P)=%d ndc e0 = %.3f,%.3f,%.3f w=%.3f",
+                     on[0], on[1], dbg[0].x, dbg[0].y, dbg[0].z, dbgW[0]);
             for (int cv = 0; cv < 2; cv++) {
                 if (conv_good_ticks[cv] >= 2 && on[cv] >= 6) {
                     conv = cv;
@@ -685,7 +688,7 @@ static void feed_touch(UITouch *t, UIView *v, bool down, bool ended) {
             if (dd.hp <= 0) continue;
 
             bool is_local = (local_valid && i == local_idx);
-            // cyan for YOUR hero, orange for everyone else
+            // CYAN for YOUR hero, orange for everyone else
             const ImU32 col_box  = is_local ? IM_COL32(0, 220, 255, 255)
                                             : IM_COL32(255, 165, 0, 255);
             const ImU32 col_line = IM_COL32(255, 165, 0, 180);
@@ -866,7 +869,7 @@ static void try_create(void) {
     objc_setAssociatedObject(v, "dl", dl, OBJC_ASSOCIATION_RETAIN);
 
     g_initialized = true;
-    mlog("overlay up (v15 matrices)");
+    mlog("overlay up (v16 row-major)");
 }
 
 static void create_loop(void) {
@@ -882,7 +885,7 @@ static void create_loop(void) {
 
 __attribute__((constructor))
 static void mlb_inject_ctor(void) {
-    mlog("=== ctor fired: VERSION 15 BUILD (matrices) ===");
+    mlog("=== ctor fired: VERSION 16 BUILD (row-major) ===");
     create_loop();
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         sleep(3);
